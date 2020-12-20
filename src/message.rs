@@ -68,19 +68,19 @@ impl std::fmt::Display for Message {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Message::Join(peer) => {
-                write!(f, "[{}]({})", self.id_str(), peer.inner().address())
+                write!(f, "[{}]({})", self.name(), peer.inner().address())
             }
             Message::Ping => {
-                write!(f, "[{}]", self.id_str())
+                write!(f, "[{}]", self.name())
             }
             Message::Membership(peers) => {
-                write!(f, "[{}]({})", self.id_str(), SliceDisplay(peers, &true))
+                write!(f, "[{}]({})", self.name(), SliceDisplay(peers, &true))
             }
             Message::Multicast(multicast) => {
                 write!(
                     f,
                     "[{}](id: {}, payload: {})",
-                    self.id_str(),
+                    self.name(),
                     multicast.id(),
                     *multicast.payload
                 )
@@ -164,13 +164,13 @@ impl Message {
     fn id(&self) -> u16 {
         match self {
             Message::Join(_) => 1,
-            Message::Ping => 3,
-            Message::Membership(_) => 4,
-            Message::Multicast(_) => 5,
+            Message::Ping => 2,
+            Message::Membership(_) => 3,
+            Message::Multicast(_) => 4,
         }
     }
     /// For displaying purposes
-    fn id_str(&self) -> &'static str {
+    fn name(&self) -> &'static str {
         match self {
             Message::Join(_) => "JOIN",
             Message::Ping => "PING",

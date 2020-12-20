@@ -1,21 +1,13 @@
-use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::net::SocketAddr;
 
-use bincode::config::LittleEndian;
-use byte::ctx::{Endian, Str};
-use byte::BytesExt;
-use derive_getters::Getters;
-use derive_more::Display;
-use parking_lot::lock_api::{MappedRwLockReadGuard, RwLockReadGuard};
-use parking_lot::{MutexGuard, RawRwLock, RwLock};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tokio::net::ToSocketAddrs;
 
-use crate::{Error, ErrorKind, Id, SliceDisplay};
+use crate::{ErrorKind, Id};
 use uuid::Uuid;
 
 /// Represents _node_ address by which it can be reached over the network.
@@ -105,6 +97,7 @@ pub struct Node {
     id: NodeId,
     // has to be behind lock as well; what will happened if contact address change because of NAT?
     address: Address,
+    /// TODO: Dedicate separate struct for peers (membership)
     peers: RwLock<HashMap<NodeId, PeerInner>>,
 }
 

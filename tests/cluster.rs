@@ -13,23 +13,22 @@ fn config_tracing(level: Level) {
         .with_max_level(level)
         .event_format(format)
         .init();
-    // completes the builder.
-    //     .finish();
-    // tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 }
 
 #[tokio::test(core_threads = 4)]
 async fn join() -> enutt::Result<()> {
-    config_tracing(Level::INFO);
-    let mut peers = Vec::with_capacity(11);
+    // config_tracing(Level::INFO);
+    let start = 9011;
+    let end = 9031;
+    let expected_peers = (end - start) + 1;
+    let mut peers = Vec::with_capacity(expected_peers);
 
     let boostrap_peer = Cluster::new(ConfigBuilder::default().finish()?).await?;
     boostrap_peer.bootstrap().await?;
     peers.push(boostrap_peer);
 
     // run peers
-    let start = 9011;
-    let end = 9031;
+
     for peer_port in start..end {
         let peer = Cluster::new(ConfigBuilder::default().port(peer_port as u16).finish()?).await?;
         peer.bootstrap().await?;
@@ -37,13 +36,14 @@ async fn join() -> enutt::Result<()> {
     }
 
     // give them few seconds to gossip
-    tokio::time::delay_for(tokio::time::Duration::from_secs(10)).await;
+    tokio::time::delay_for(tokio::time::Duration::from_secs(6)).await;
 
     // validate membership lists
-    peers.into_iter().enumerate().for_each(|(i, peer)| {
+    peers.into_iter().enumerate().for_each(|(_i, peer)| {
         let node = peer.context().node();
         let peers = node.peers().read();
-        assert_eq!((end - start) + 1, peers.len());
+        assert_eq!(expected_peers, peers.len());
+        // TODO: Validate content of membership lists
         drop(peers);
     });
 

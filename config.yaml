@@ -2,3 +2,7 @@ app_port: 8081
 network:
   bootstrap_nodes:
     - 127.0.0.1:8081
+gossip:
+  fanout: 4
+  frequency: 200
+  rate: 2

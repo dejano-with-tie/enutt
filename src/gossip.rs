@@ -5,61 +5,60 @@ use std::fmt::Display;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
-use futures::future::FutureExt;
-use futures::{StreamExt, TryFutureExt};
-use parking_lot::{Mutex, RwLock};
+use futures::StreamExt;
+use parking_lot::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
 use rand::rngs::ThreadRng;
 use rand::Rng;
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tracing::{debug, error, info, info_span, instrument, warn};
+use tracing::{debug, info, info_span, instrument, warn};
 use tracing_futures::Instrument;
 
 use crate::connection::Connection;
-use crate::message::{Message, Multicast, MulticastId, MulticastInner};
+use crate::message::{Message, Multicast, MulticastId};
 use crate::node::{Node, Peer, PeerId, PeerInner};
+use crate::SliceDisplay;
 
+/// Wrap `Multicast` message with `hop_count`
 struct MulticastWrapper {
-    pub hop_count: usize,
+    /// how many times this message has been gossiped
+    pub cycle_cnt: usize,
     pub message: Multicast,
 }
 
 impl Display for MulticastWrapper {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "(c:{}) {}", self.hop_count, self.message)
+        write!(f, "(c:{}) {}", self.cycle_cnt, self.message)
     }
 }
 
 impl MulticastWrapper {
     pub fn new(message: Multicast) -> Self {
         MulticastWrapper {
-            hop_count: Default::default(),
+            cycle_cnt: Default::default(),
             message,
         }
     }
-    pub fn hop_count(&self) -> usize {
-        self.hop_count
+    pub fn cycle_cnt(&self) -> usize {
+        self.cycle_cnt
     }
-    pub fn inc_hop_count(&mut self) {
-        self.hop_count += 1;
+    pub fn inc_cycle_cnt(&mut self) {
+        self.cycle_cnt += 1;
     }
 }
 
 /// Start Gossip task in background
 ///
 /// Return sender which is used to queue new multicasts
-#[instrument(skip(sender), name = "gossip")]
-pub fn run(sender: Arc<Node>) -> UnboundedSender<Multicast> {
-    // TODO: protocol_period // after what time to stop
-    let cycle_count = 4;
+#[instrument(skip(sender, cfg), name = "gossip")]
+pub fn run(cfg: &crate::config::Gossip, sender: Arc<Node>) -> UnboundedSender<Multicast> {
     let gossip = Arc::new(Gossip {
         sender,
+        // TODO: move this to separate struct
         queue: RwLock::new(vec![]),
         seen: RwLock::new(vec![]),
-        fanout: 4,            // TODO: Config
-        cycle_frequency: 300, // TODO: Config
-        cycle_rate: 4,        // TODO: Config
-        cycle_count,
+        fanout: cfg.fanout(),
+        cycle_frequency: cfg.frequency(),
+        cycle_rate: cfg.rate(),
     });
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -75,7 +74,7 @@ pub fn run(sender: Arc<Node>) -> UnboundedSender<Multicast> {
     tx
 }
 
-/// queue multicasts
+/// Queue messages
 /// Every multicast has to go through this fn before it is queued
 async fn queue_multicast(mut rx: UnboundedReceiver<Multicast>, gossip: Arc<Gossip>) {
     while let Some(mut multicast) = rx.recv().await {
@@ -106,9 +105,6 @@ pub struct Gossip {
     /// current node
     sender: Arc<Node>,
     cycle_rate: usize,
-    // should be calculated at runtime; GOSSIP_RATE * (((member_count + 1) as f64).ln().ceil() as usize);
-    // where gossip rate is arbitrary number [1..6], maybe >=2 && 4 <=
-    cycle_count: usize,
 }
 /// Implements simple gossip based protocol
 impl Gossip {
@@ -119,49 +115,70 @@ impl Gossip {
             let now = round_interval.tick().await;
             debug!("starting round (Time now = {:?})", now);
 
+            let members_len = { self.sender.peers().read().len() };
+            let cycle_rate = self.cycle_rate * (((members_len + 1) as f64).ln().ceil() as usize);
+            debug!(
+                "membership size: {}; cycle rate: {}",
+                members_len, cycle_rate
+            );
+
             // TODO: Make sure all multicasts in queue are unique (could receive two same multicasts and queued them both)
-            self.cycle();
+            self.cycle(cycle_rate);
         }
     }
 
-    fn cycle(self: &Arc<Self>) {
-        let mut queue_w = self.queue.write();
+    /// Gossip cycle which is executed every `cycle_frequency` milliseconds.
+    ///
+    /// In one cycle, each message from `queue` is gossiped to `fanout` randomly selected peers.
+    /// If message is gossiped `cycle_rate` times, it will be removed from `queue`.
+    ///
+    /// To improve selection of random peers, `infected` list is passed on with message so next
+    /// peer won't gossip to already infected peers.
+    fn cycle(self: &Arc<Self>, cycle_rate: usize) {
+        let mut lock = self.queue.write();
         // remove messages which have been sent > _cycle_count_ times
-        queue_w.retain(|multicast| multicast.hop_count() < self.cycle_count);
-        // inc hop count
-        queue_w
-            .iter_mut()
-            .for_each(|multicast| multicast.inc_hop_count());
+        lock.retain(|multicast| multicast.cycle_cnt() < cycle_rate);
 
-        drop(queue_w);
-
-        // clone peers here and propagate them into calling fn down (use reference!)
-
-        // multicast
-        let queue_r = self.queue.read();
-        let infected: HashMap<MulticastId, Option<Arc<Vec<Peer>>>> = queue_r
+        let lock = RwLockWriteGuard::downgrade_to_upgradable(lock);
+        // select random peers to gossip to
+        let rnd_peers: HashMap<MulticastId, Option<Arc<Vec<Peer>>>> = lock
             .iter()
             .map(|multicast| {
-                info!("execute {}", multicast);
-                match self.multicast(&multicast.message) {
-                    None => (*multicast.message.id(), None),
-                    Some(peers) => (*multicast.message.id(), Some(peers)),
-                }
+                let peers = match self.random_peers(multicast.message.infected()) {
+                    Some(peers) => Arc::new(peers),
+                    None => return (*multicast.message.id(), None),
+                };
+                (*multicast.message.id(), Some(peers))
             })
             .collect();
-        drop(queue_r);
 
-        // TODO: Write infected before sending!
-        // write infected
-        let mut queue_w = self.queue.write();
-        queue_w.iter_mut().for_each(|multicast| {
-            if let Some(Some(peers)) = infected.get(multicast.message.id()) {
+        let mut lock = RwLockUpgradableReadGuard::upgrade(lock);
+        // inc hop count and update infected
+        lock.iter_mut().for_each(|multicast| {
+            // we increase hop count even if there are no nodes to which we could gossip to
+            // Another way to do it would be to increase only when it is sent to someone else
+            // but do also time based deletion (message can expire + hop_count_limit)
+            multicast.inc_cycle_cnt();
+
+            if let Some(peers) = rnd_peers.get(multicast.message.id()).unwrap() {
                 peers.iter().for_each(|peer| {
                     multicast.message.insert_infected(*peer.id());
                 });
             }
         });
-        drop(queue_w);
+
+        // gossip
+        let lock = RwLockWriteGuard::downgrade(lock);
+        lock.iter().for_each(|multicast| {
+            if let Some(peers) = rnd_peers.get(multicast.message.id()).unwrap() {
+                info!(
+                    "execute {}; targets {}",
+                    multicast,
+                    SliceDisplay(peers, &true)
+                );
+                self.multicast(&multicast.message, peers);
+            }
+        });
     }
 
     pub fn is_seen(&self, id: &MulticastId) -> bool {
@@ -172,17 +189,10 @@ impl Gossip {
         self.seen.write().push(id);
     }
 
-    pub fn multicast(&self, multicast: &Multicast) -> Option<Arc<Vec<Peer>>> {
-        // update multicast state
-        // multicast.infected.insert(self.sender.id());
-        let peers = match self.random_peers(multicast.infected()) {
-            Some(peers) => Arc::new(peers),
-            None => return None,
-        };
-
+    pub fn multicast(&self, multicast: &Multicast, peers: &Arc<Vec<Peer>>) {
         let multicast = multicast.clone();
         // send actual message
-        let peers_to_msg = Arc::clone(&peers);
+        let peers_to_msg = Arc::clone(peers);
         tokio::spawn(async move {
             let messages =
                 futures::stream::iter(peers_to_msg.iter()).for_each_concurrent(None, |peer| {
@@ -199,15 +209,11 @@ impl Gossip {
 
             messages.await
         });
-
-        Some(peers)
     }
 
-    // /// TODO: Maybe pass in message origin
     fn random_peers(&self, infected: &HashSet<PeerId>) -> Option<Vec<Peer>> {
         let peers = &self.sender.peers().read();
 
-        // TODO: What if message is sent to same peer
         let peers: Vec<(&PeerId, &PeerInner)> = peers
             .iter()
             // skip myself

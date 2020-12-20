@@ -91,7 +91,7 @@ impl Cluster {
         let (server_cfg, _cert) = crate::config::server::self_signed()?;
 
         // gossip _task_
-        let gossip_tx = crate::gossip::run(Arc::clone(&node));
+        let gossip_tx = crate::gossip::run(config.gossip(), Arc::clone(&node));
 
         // configure context
         let context = Context {

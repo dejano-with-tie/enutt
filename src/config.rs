@@ -68,6 +68,7 @@ pub mod server {
 pub struct Config {
     app_port: u16,
     network: Network,
+    gossip: Gossip,
 }
 
 impl Config {
@@ -76,6 +77,9 @@ impl Config {
     }
     pub fn network(&self) -> &Network {
         &self.network
+    }
+    pub fn gossip(&self) -> &Gossip {
+        &self.gossip
     }
 }
 
@@ -87,6 +91,25 @@ pub struct Network {
 impl Network {
     pub fn bootstrap_nodes(&self) -> &Vec<Address> {
         &self.bootstrap_nodes
+    }
+}
+
+#[derive(Deserialize)]
+pub struct Gossip {
+    fanout: usize,
+    frequency: u64,
+    rate: usize,
+}
+
+impl Gossip {
+    pub fn fanout(&self) -> usize {
+        self.fanout
+    }
+    pub fn frequency(&self) -> u64 {
+        self.frequency
+    }
+    pub fn rate(&self) -> usize {
+        self.rate
     }
 }
 
