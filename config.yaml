@@ -1,5 +1,6 @@
 app_port: 8081
 network:
+  cert_name: enutt
   bootstrap_nodes:
     - 127.0.0.1:8081
 gossip:

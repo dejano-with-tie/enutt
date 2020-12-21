@@ -13,7 +13,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::{debug, info, info_span, instrument, warn};
 use tracing_futures::Instrument;
 
-use crate::connection::Connection;
+use crate::client::Client;
+use crate::connection::ConnectionHolder;
 use crate::message::{Message, Multicast, MulticastId};
 use crate::node::{Node, Peer, PeerId, PeerInner};
 use crate::SliceDisplay;
@@ -49,10 +50,15 @@ impl MulticastWrapper {
 /// Start Gossip task in background
 ///
 /// Return sender which is used to queue new multicasts
-#[instrument(skip(sender, cfg), name = "gossip")]
-pub fn run(cfg: &crate::config::Gossip, sender: Arc<Node>) -> UnboundedSender<Multicast> {
+#[instrument(skip(sender, cfg, client), name = "gossip")]
+pub fn run(
+    cfg: &crate::config::Gossip,
+    client: Arc<Client>,
+    sender: Arc<Node>,
+) -> UnboundedSender<Multicast> {
     let gossip = Arc::new(Gossip {
         sender,
+        client,
         // TODO: move this to separate struct
         queue: RwLock::new(vec![]),
         seen: RwLock::new(vec![]),
@@ -99,7 +105,8 @@ pub struct Gossip {
     queue: RwLock<Vec<MulticastWrapper>>,
     /// Already gossiped about these. Used for filtering when queueing new multicasts
     seen: RwLock<Vec<MulticastId>>,
-
+    /// Quic client
+    client: Arc<Client>,
     fanout: usize,
     cycle_frequency: u64,
     /// current node
@@ -193,17 +200,18 @@ impl Gossip {
         let multicast = multicast.clone();
         // send actual message
         let peers_to_msg = Arc::clone(peers);
+        let client = Arc::clone(&self.client);
         tokio::spawn(async move {
             let messages =
                 futures::stream::iter(peers_to_msg.iter()).for_each_concurrent(None, |peer| {
+                    // TODO: This cloning is madness
                     let multicast = multicast.clone();
+                    let client = Arc::clone(&client);
                     async move {
-                        Connection::send_uni(
-                            peer.inner().address(),
-                            &Message::Multicast(multicast),
-                        )
-                        .await
-                        .unwrap();
+                        client
+                            .send_uni(peer.inner().address(), &Message::Multicast(multicast))
+                            .await
+                            .unwrap();
                     }
                 });
 

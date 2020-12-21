@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use crate::node::Peer;
 
+pub mod client;
 pub mod cluster;
 pub mod config;
 pub mod connection;
@@ -12,6 +13,7 @@ pub mod gossip;
 pub mod message;
 pub mod node;
 pub mod server;
+pub mod shutdown;
 
 /// Error and Result type alias
 pub type Error = Box<dyn std::error::Error + Send + Sync>;

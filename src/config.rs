@@ -1,12 +1,30 @@
 use config::FileFormat;
-use derive_getters::Getters;
 use serde::Deserialize;
 
 use crate::node::Address;
+use crate::ErrorKind;
+use std::time::Duration;
+
+pub static CERT_DOMAIN_NAME: &str = "enutt";
+
+fn new_transport_cfg(
+    idle_timeout_msec: u64,
+    keep_alive_interval_msec: u32,
+) -> quinn::TransportConfig {
+    let mut transport_config = quinn::TransportConfig::default();
+    let _ = transport_config
+        .max_idle_timeout(Some(Duration::from_millis(idle_timeout_msec)))
+        .map_err(|e| ErrorKind::Configuration(e.to_string()))
+        .unwrap_or(&mut Default::default());
+    let _ = transport_config
+        .keep_alive_interval(Some(Duration::from_millis(keep_alive_interval_msec.into())));
+    transport_config
+}
 
 pub mod client {
     use std::sync::Arc;
 
+    use crate::config::new_transport_cfg;
     use quinn::ClientConfig;
 
     /// Dummy certificate verifier that treats any certificate as valid.
@@ -27,6 +45,7 @@ pub mod client {
     /// Configure client to trust any certificate
     pub fn insecure() -> ClientConfig {
         let mut cfg = quinn::ClientConfigBuilder::default().build();
+        cfg.transport = Arc::new(new_transport_cfg(30_000, 10_000));
 
         // Get a mutable reference to the 'crypto' config in the 'client config'..
         let tls_cfg: &mut rustls::ClientConfig = Arc::get_mut(&mut cfg.crypto).unwrap();
@@ -41,9 +60,10 @@ pub mod client {
 }
 
 pub mod server {
-    pub static CERT_DOMAIN_NAME: &str = "enutt";
-
     use quinn::{Certificate, CertificateChain, PrivateKey, ServerConfig, ServerConfigBuilder};
+
+    use crate::config::{new_transport_cfg, CERT_DOMAIN_NAME};
+    use std::sync::Arc;
 
     /// Returns default server configuration along with its certificate.
     pub fn self_signed() -> crate::Result<(ServerConfig, Vec<u8>)> {
@@ -51,7 +71,10 @@ pub mod server {
         let cert_der = cert.serialize_der().unwrap();
         let priv_key = cert.serialize_private_key_der();
 
-        let mut cfg_builder = ServerConfigBuilder::new(ServerConfig::default());
+        let mut config = ServerConfig::default();
+        config.transport = Arc::new(new_transport_cfg(30_000, 10_000));
+
+        let mut cfg_builder = ServerConfigBuilder::new(config);
 
         cfg_builder.certificate(
             CertificateChain::from_certs(vec![Certificate::from_der(&cert_der)?]),
@@ -166,6 +189,7 @@ impl ConfigBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn when_default_read_from_file() {
         let config = ConfigBuilder::default().finish().unwrap();

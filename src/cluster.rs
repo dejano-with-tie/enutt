@@ -9,15 +9,17 @@ use futures::StreamExt;
 use futures::{Future, FutureExt};
 use parking_lot::{Mutex, RawMutex};
 use quinn::{Endpoint, NewConnection, RecvStream, SendStream};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{Sender, UnboundedSender};
+use tokio::sync::Notify;
 use tracing::{error, info, info_span, instrument, warn};
 use tracing_futures::Instrument;
 use uuid::Uuid;
 
+use crate::client::Client;
 use crate::config::{Config, ConfigBuilder};
-use crate::connection::Connection;
+use crate::connection::ConnectionHolder;
 use crate::message::{Message, Multicast};
-use crate::node::{Address, Peer};
+use crate::node::{Address, Peer, PeerInner};
 use crate::{Error, ErrorKind, Id};
 
 use super::node::Node;
@@ -27,13 +29,20 @@ pub struct Cluster {
     context: Arc<Context>,
     client_cfg: quinn::ClientConfig,
     server_cfg: quinn::ServerConfig,
+    shutdown_tx: Sender<()>,
+    shutdown_handle: Arc<Notify>,
 }
 
-/// Holds state
+/// Holds shared state
+/// TODO: Maybe rename this to shared?
 pub struct Context {
     config: Config,
+    // TODO: Do we actually need Membership struct here?
     node: Arc<Node>,
+    /// every part of app should be able to gossip
     gossip_tx: UnboundedSender<Multicast>,
+    /// every part of app should be able to communicate over quic
+    client: Arc<Client>,
 }
 
 impl Context {
@@ -46,6 +55,10 @@ impl Context {
 
     pub fn gossip_tx(&self) -> &UnboundedSender<Multicast> {
         &self.gossip_tx
+    }
+
+    pub fn client(&self) -> &Arc<Client> {
+        &self.client
     }
 
     // TODO: Clean this up with ENTRY thing
@@ -74,40 +87,84 @@ impl Context {
                 .unwrap(),
         ))
     }
+    pub fn remove(&self, peer: Peer) -> Option<PeerInner> {
+        let mut peers = self.node.peers().write();
+        peers.remove(peer.id())
+    }
 }
 
 impl Cluster {
     pub async fn new(config: Config) -> Result<Self> {
-        // discover who I am
-        let address = Address(format!("127.0.0.1:{}", config.app_port()));
-        let node = Arc::new(Node::new(Id::default(), address, HashMap::new()));
-
-        // discover nat capabilities
-
         // configure client
         let client_cfg = crate::config::client::insecure();
 
         // configure server
         let (server_cfg, _cert) = crate::config::server::self_signed()?;
 
+        // client
+        // TODO: Handle parsing of bootstrap ip/port in one place
+        let client = Arc::new(Client::new(client_cfg.clone())?);
+
+        // discover who I am
+        let address = Address(format!("127.0.0.1:{}", config.app_port()));
+        let node = Arc::new(Node::new(Id::default(), address, HashMap::new()));
+
+        // discover nat capabilities
+
         // gossip _task_
-        let gossip_tx = crate::gossip::run(config.gossip(), Arc::clone(&node));
+        let gossip_tx = crate::gossip::run(config.gossip(), Arc::clone(&client), Arc::clone(&node));
 
         // configure context
-        let context = Context {
+        let context = Arc::new(Context {
             config,
             gossip_tx,
             node: Arc::clone(&node),
-        };
+            client: Arc::clone(&client),
+        });
+
+        // shutdown
+        // TODO: This is bs, improve (no idea how atm)
+        let shutdown = Arc::new(Notify::new());
+        let shutdown_handle = shutdown.clone();
+
+        let ctx_shutdown = Arc::clone(&context);
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(5);
+        tokio::spawn(async move {
+            if let Some(()) = shutdown_rx.recv().await {
+                // TODO: do bi_send leave
+                ctx_shutdown
+                    .gossip_tx
+                    .send(Multicast::with_payload(Message::Leave(Peer::from(
+                        ctx_shutdown.node().as_ref(),
+                    ))))
+                    .unwrap();
+
+                // random sleep, maybe later on provide a gossip response
+                tokio::time::delay_for(tokio::time::Duration::from_secs(5)).await;
+                shutdown.notify();
+            }
+        });
 
         // return api which is exposing send bi/uni/udp messages
         Ok(Self {
-            context: Arc::new(context),
+            context: Arc::clone(&context),
             client_cfg,
             server_cfg,
+            shutdown_tx,
+            shutdown_handle,
         })
     }
 
+    pub async fn shutdown(&mut self) {
+        println!("sending shutdown signal");
+        self.shutdown_tx.send(()).await.unwrap();
+        // TODO: here add oneshot channel to await shutdown success
+        self.shutdown_handle.notified().await;
+        println!("received shutdown response");
+    }
+
+    /// 1. Run server task
+    /// 2. Join cluster
     pub async fn bootstrap(&self) -> Result<(), ErrorKind> {
         // setup nat _task_, UPnP
 
@@ -138,9 +195,8 @@ impl Cluster {
         };
 
         // Send _join_ message and update members
-        let message = Message::Join(Peer::from(self.context.node.as_ref()));
         let (_, mut recv_stream) = connection
-            .send_bi(&message)
+            .send_bi(&Message::Join(Peer::from(self.context.node.as_ref())))
             .await
             .map_err(|_e| ErrorKind::BootstrapFailure)?;
 
@@ -154,13 +210,11 @@ impl Cluster {
 
         return match response {
             Message::Membership(peers) => {
-                peers
-                    .into_iter()
-                    .for_each(|peer| match self.context.add_peer(peer) {
-                        Err(err) => warn!("failed: {:?}", err),
-                        Ok(_) => {}
-                    });
-
+                peers.into_iter().for_each(|peer| {
+                    if let Err(err) = self.context.add_peer(peer) {
+                        warn!("failed: {:?}", err)
+                    }
+                });
                 Ok(())
             }
             _ => {
@@ -168,33 +222,17 @@ impl Cluster {
                 return Err(ErrorKind::BootstrapFailure);
             }
         };
-
-        // let message = Message::Join("hello my friend".into());
-        // match message.write(&mut send_stream).await {
-        //     Ok(_) => {}
-        //     Err(crate::message::Error::StreamWrite(quinn::WriteError::Stopped(e))) => {
-        //         eprintln!("failed to send message; stream is closed; {}", e);
-        //         // TODO: Return indication that stream is closed
-        //     }
-        //     Err(e) => eprintln!("failed to send message; {}", e),
-        // }
-        // send_stream.write_all(b"will this fail?").await?;
     }
 
-    async fn connect_any(
+    async fn connect_any<'a>(
         &self,
-        bootstrap_nodes: &[Address],
-    ) -> Result<Option<(Connection, Address)>, crate::ErrorKind> {
+        bootstrap_nodes: &'a [Address],
+    ) -> Result<Option<(ConnectionHolder, &'a Address)>, crate::ErrorKind> {
         if bootstrap_nodes.is_empty() {
             return Err(ErrorKind::Configuration(
                 "no known nodes; unable to bootstrap".into(),
             ));
         }
-
-        let mut connection = Connection::new(self.client_cfg.clone()).map_err(|e| {
-            error!("failed: {reason}", reason = e);
-            ErrorKind::Unexpected("unable to create client connection".into())
-        })?;
 
         // Attempt to connect to all nodes and return the first one to succeed
         let mut bootstrap_nodes = bootstrap_nodes
@@ -209,37 +247,20 @@ impl Cluster {
         }
 
         let bootstrap_node = bootstrap_nodes.next().unwrap();
-        if let Err(e) = connection.connect_to(bootstrap_node).await {
-            error!("unable to connect to bootstrap node: {reason}", reason = e);
-            return Ok(None);
+        match self.context.client.connect_to(bootstrap_node).await {
+            Err(e) => {
+                error!("unable to connect to bootstrap node: {reason}", reason = e);
+                Ok(None)
+            }
+            Ok(conn) => Ok(Some((conn, bootstrap_node))),
         }
-
-        Ok(Some((connection, bootstrap_node.clone())))
     }
 
     pub fn context(&self) -> &Arc<Context> {
         // cfg!(test)
         &self.context
     }
-}
-
-async fn create_conn(address: &Address) -> Result<(SendStream, RecvStream)> {
-    let client_cfg = crate::config::client::insecure();
-    let mut endpoint_builder = Endpoint::builder();
-    endpoint_builder.default_client_config(client_cfg);
-
-    // Bind this endpoint to a UDP socket on the given client address.
-    // let OS decide about port
-    // let sock = std::net::UdpSocket::bind("127.0.0.1:0")?;
-    let (endpoint, _) = endpoint_builder.bind(&"127.0.0.1:0".parse::<SocketAddr>()?)?;
-
-    // Connect to the server passing in the server name which is supposed to be in the server certificate.
-    let NewConnection { connection, .. } = endpoint
-        .connect(
-            &SocketAddr::try_from(address)?,
-            crate::config::server::CERT_DOMAIN_NAME,
-        )?
-        .await?;
-    info!(addr = ?address, "created endpoint");
-    Ok(connection.open_bi().await?)
+    pub fn shutdown_handle(&self) -> &Arc<Notify> {
+        &self.shutdown_handle
+    }
 }

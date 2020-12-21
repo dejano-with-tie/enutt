@@ -28,7 +28,7 @@ pub async fn run(ctx: Arc<Context>, cfg: ServerConfig) -> Result<()> {
         ErrorKind::BootstrapFailure
     })?;
 
-    let (endpoint, mut incoming) = match endpoint.bind(&address) {
+    let (endpoint, incoming) = match endpoint.bind(&address) {
         Ok(v) => v,
         Err(e) => {
             error!(?e);
@@ -195,14 +195,16 @@ impl RequestHandler {
                 let payload = multicast.payload().clone();
                 self.ctx.gossip_tx().send(multicast).unwrap();
 
-                if let Message::Join(peer) = payload {
-                    match self.ctx.add_peer(peer) {
-                        _ => {
-                            // let node = self.ctx.node();
-                            // let peers = node.peers().read();
-                            // println!("{} -> {:?}", node.address(), peers);
+                match payload {
+                    Message::Join(peer) => {
+                        self.ctx.add_peer(peer);
+                    }
+                    Message::Leave(peer) => {
+                        if let Some(peer) = self.ctx.remove(peer) {
+                            info!("remove peer: {}", peer = peer);
                         }
-                    };
+                    }
+                    _ => {}
                 }
             }
             _ => warn!("dunno how to handle this message"),

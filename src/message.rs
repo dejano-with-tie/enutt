@@ -59,6 +59,7 @@ pub struct MessageHeader {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Message {
     Join(Peer),
+    Leave(Peer),
     Ping,
     Membership(Vec<Peer>),
     Multicast(Multicast),
@@ -68,6 +69,9 @@ impl std::fmt::Display for Message {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Message::Join(peer) => {
+                write!(f, "[{}]({})", self.name(), peer.inner().address())
+            }
+            Message::Leave(peer) => {
                 write!(f, "[{}]({})", self.name(), peer.inner().address())
             }
             Message::Ping => {
@@ -164,15 +168,17 @@ impl Message {
     fn id(&self) -> u16 {
         match self {
             Message::Join(_) => 1,
-            Message::Ping => 2,
-            Message::Membership(_) => 3,
-            Message::Multicast(_) => 4,
+            Message::Leave(_) => 2,
+            Message::Ping => 3,
+            Message::Membership(_) => 4,
+            Message::Multicast(_) => 5,
         }
     }
     /// For displaying purposes
     fn name(&self) -> &'static str {
         match self {
             Message::Join(_) => "JOIN",
+            Message::Leave(_) => "LEAVE",
             Message::Ping => "PING",
             Message::Membership(_) => "MEMBERSHIP",
             Message::Multicast(_) => "MULTICAST",
