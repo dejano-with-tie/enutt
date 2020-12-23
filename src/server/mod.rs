@@ -193,14 +193,14 @@ impl RequestHandler {
         match request {
             Message::Multicast(multicast) => {
                 let payload = multicast.payload().clone();
-                self.ctx.gossip_tx().send(multicast).unwrap();
+                self.ctx.gossip().queue(multicast);
 
                 match payload {
                     Message::Join(peer) => {
-                        self.ctx.add_peer(peer);
+                        self.ctx.membership().add(peer);
                     }
                     Message::Leave(peer) => {
-                        if let Some(peer) = self.ctx.remove(peer) {
+                        if let Some(peer) = self.ctx.membership().remove(&peer) {
                             info!("remove peer: {}", peer = peer);
                         }
                     }

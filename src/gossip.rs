@@ -16,9 +16,9 @@ use tracing::{debug, info, info_span, instrument, warn};
 use tracing_futures::Instrument;
 
 use crate::client::Client;
-use crate::connection::ConnectionHolder;
+use crate::membership::Membership;
 use crate::message::{Message, Multicast, MulticastId};
-use crate::node::{Address, Node, Peer, PeerId, PeerInner};
+use crate::node::{Node, NodeId, Peer, PeerId, PeerInner};
 use crate::SliceDisplay;
 
 /// Wrap `Multicast` message with `hop_count`
@@ -49,83 +49,95 @@ impl MulticastWrapper {
     }
 }
 
+pub struct GossipQueue {
+    queue: Arc<RwLock<Vec<MulticastWrapper>>>,
+    /// Already gossiped about these. Used for filtering when queueing new multicasts
+    seen: RwLock<Vec<MulticastId>>,
+    sender_id: NodeId,
+}
+
+impl GossipQueue {
+    /// Queue messages
+    /// Every multicast has to go through this fn before it is queued
+    pub fn queue(&self, mut multicast: Multicast) {
+        if self.is_seen(multicast.id()) {
+            warn!("skip; {}", multicast);
+            return;
+        }
+
+        info!("queue {}", multicast);
+        self.mark_as_seen(*multicast.id());
+
+        // we are infected now
+        multicast.insert_infected(self.sender_id);
+
+        self.queue.write().push(MulticastWrapper::new(multicast));
+    }
+
+    pub fn peek(&mut self) {}
+
+    fn is_seen(&self, id: &MulticastId) -> bool {
+        self.seen.read().contains(id)
+    }
+
+    fn mark_as_seen(&self, id: MulticastId) {
+        self.seen.write().push(id);
+    }
+}
+
 /// Start Gossip task in background
 ///
 /// Return sender which is used to queue new multicasts
-#[instrument(skip(sender, cfg, client), name = "gossip")]
+#[instrument(skip(sender, cfg, client, membership), name = "gossip")]
 pub fn run(
     cfg: &crate::config::Gossip,
     client: Arc<Client>,
     sender: Arc<Node>,
-) -> UnboundedSender<Multicast> {
+    membership: Arc<Membership>,
+) -> GossipQueue {
     let gossip = Arc::new(Gossip {
-        sender,
+        membership,
         client,
         // TODO: move this to separate struct
         // TODO: Do a priority queue here! REALLY DO THIS ONE
-        queue: RwLock::new(vec![]),
-        seen: RwLock::new(vec![]),
+        queue: Arc::new(RwLock::new(vec![])),
         fanout: cfg.fanout(),
         cycle_frequency: cfg.frequency(),
         cycle_rate: cfg.rate(),
     });
 
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-    // queue messages
-    tokio::spawn(queue_multicast(rx, Arc::clone(&gossip)).in_current_span());
+    let gossip_queue = GossipQueue {
+        seen: RwLock::new(vec![]),
+        queue: Arc::clone(&gossip.queue),
+        sender_id: sender.id(),
+    };
 
     // run gossip protocol
-    let run_gossip = Arc::clone(&gossip);
-    let gossip_round_task = async move { run_gossip.run().await };
-    tokio::spawn(gossip_round_task.instrument(info_span!("round")));
+    tokio::spawn(async move { gossip.run().await }.instrument(info_span!("cycle")));
 
-    tx
-}
-
-/// Queue messages
-/// Every multicast has to go through this fn before it is queued
-async fn queue_multicast(mut rx: UnboundedReceiver<Multicast>, gossip: Arc<Gossip>) {
-    while let Some(mut multicast) = rx.recv().await {
-        // skip if multicast has been seen already
-        if gossip.is_seen(multicast.id()) {
-            warn!("skip; {}", multicast);
-            continue;
-        }
-
-        info!("queue {}", multicast);
-        gossip.mark_as_seen(*multicast.id());
-
-        // we are infected now
-        multicast.insert_infected(gossip.sender.id());
-
-        gossip.queue.write().push(MulticastWrapper::new(multicast));
-    }
+    gossip_queue
 }
 
 pub struct Gossip {
-    /// To gossip about in next round
-    queue: RwLock<Vec<MulticastWrapper>>,
-    /// Already gossiped about these. Used for filtering when queueing new multicasts
-    seen: RwLock<Vec<MulticastId>>,
+    membership: Arc<Membership>,
+    /// To gossip about in next cycle
+    queue: Arc<RwLock<Vec<MulticastWrapper>>>,
     /// Quic client
     client: Arc<Client>,
     fanout: usize,
     cycle_frequency: u64,
-    /// current node
-    sender: Arc<Node>,
     cycle_rate: usize,
 }
 /// Implements simple gossip based protocol
 impl Gossip {
     pub async fn run(self: &Arc<Self>) -> crate::Result<()> {
-        let mut round_interval =
+        let mut cycle_interval =
             tokio::time::interval(std::time::Duration::from_millis(self.cycle_frequency));
         loop {
-            let now = round_interval.tick().await;
-            debug!("starting round (Time now = {:?})", now);
+            let now = cycle_interval.tick().await;
+            debug!("starting cycle (Time now = {:?})", now);
 
-            let members_len = { self.sender.peers().read().len() };
+            let members_len = self.membership.len();
             let cycle_rate = self.cycle_rate * (((members_len + 1) as f64).ln().ceil() as usize);
             debug!(
                 "membership size: {}; cycle rate: {}",
@@ -149,32 +161,12 @@ impl Gossip {
         // remove messages which have been sent > _cycle_count_ times
         messages.retain(|multicast| multicast.cycle_cnt() < cycle_rate);
 
-        let messages = RwLockWriteGuard::downgrade_to_upgradable(messages);
-        // select random peers to gossip to
-        let rnd_peers: HashMap<MulticastId, Option<Arc<Vec<Peer>>>> = messages
-            .iter()
-            .map(|multicast| {
-                let peers = match self.random_peers(multicast.message.infected()) {
-                    Some(peers) => Arc::new(peers),
-                    None => return (*multicast.message.id(), None),
-                };
-                (*multicast.message.id(), Some(peers))
-            })
-            .collect();
-
-        let mut messages = RwLockUpgradableReadGuard::upgrade(messages);
         // inc hop count and update infected
         messages.iter_mut().for_each(|multicast| {
             // we increase hop count even if there are no nodes to which we could gossip to
             // Another way to do it would be to increase only when it is sent to someone else
             // but do also time based deletion (message can expire + hop_count_limit)
             multicast.inc_cycle_cnt();
-
-            if let Some(peers) = rnd_peers.get(multicast.message.id()).unwrap() {
-                peers.iter().for_each(|peer| {
-                    multicast.message.insert_infected(*peer.id());
-                });
-            }
         });
 
         // NOTE: Micro optimization: When queue is too big, do a piggyback of messages. The question is, what is too large?
@@ -183,23 +175,14 @@ impl Gossip {
         // gossip
         let messages = RwLockWriteGuard::downgrade(messages);
         messages.iter().for_each(|multicast| {
-            if let Some(peers) = rnd_peers.get(multicast.message.id()).unwrap() {
-                info!(
-                    "execute {}; targets {}",
-                    multicast,
-                    SliceDisplay(peers, &true)
-                );
-                self.multicast(&multicast.message, peers);
-            }
+            if let Some(peers) = self
+                .membership
+                .random(self.fanout, multicast.message.infected())
+            {
+                info!("execute {}; targets {}", multicast, SliceDisplay(&peers));
+                self.multicast(&multicast.message, &Arc::new(peers))
+            };
         });
-    }
-
-    pub fn is_seen(&self, id: &MulticastId) -> bool {
-        self.seen.read().contains(id)
-    }
-
-    pub fn mark_as_seen(&self, id: MulticastId) {
-        self.seen.write().push(id);
     }
 
     pub fn multicast(&self, multicast: &Multicast, peers: &Arc<Vec<Peer>>) {
@@ -222,39 +205,5 @@ impl Gossip {
 
             messages.await
         });
-    }
-
-    fn random_peers(&self, infected: &HashSet<PeerId>) -> Option<Vec<Peer>> {
-        let peers = &self.sender.peers().read();
-
-        let peers: Vec<(&PeerId, &PeerInner)> = peers
-            .iter()
-            // skip myself
-            .filter(|(id, _)| *id != &self.sender.id())
-            // skip infected peers
-            .filter(|(id, _)| !infected.iter().any(|peer| *id == peer))
-            .map(|(id, peer)| (id, peer))
-            .collect();
-
-        let peers_len = peers.len();
-
-        match peers_len {
-            0 => None,
-            1 => Some(vec![Peer::from(*peers.get(0).unwrap())]),
-            _ => {
-                let fanout = min(self.fanout, peers_len);
-                Some(
-                    (0..fanout)
-                        .map(|_i| {
-                            Peer::from(
-                                *peers
-                                    .get(ThreadRng::default().gen_range(0, peers_len))
-                                    .unwrap(),
-                            )
-                        })
-                        .collect(),
-                )
-            }
-        }
     }
 }

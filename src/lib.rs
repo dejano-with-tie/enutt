@@ -15,6 +15,7 @@ pub mod message;
 pub mod node;
 pub mod server;
 pub mod shutdown;
+pub mod swim;
 
 /// Error and Result type alias
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -32,6 +33,8 @@ pub enum ErrorKind {
     Configuration(String),
     #[error("Known member: {0:?}")]
     KnownMember(Peer),
+    #[error("Failed to shutdown gracefully")]
+    ShutdownFailure,
 }
 
 impl From<Error> for ErrorKind {
@@ -68,18 +71,14 @@ impl Display for Id<Uuid> {
     }
 }
 
-struct SliceDisplay<'a, T: 'a>(&'a [T], &'static bool);
+struct SliceDisplay<'a, T: 'a>(&'a [T]);
 
 impl<'a, T: std::fmt::Display + 'a> std::fmt::Display for SliceDisplay<'a, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let mut first = true;
         for item in self.0 {
             if !first {
-                if *self.1 {
-                    write!(f, ", {}", item)?;
-                } else {
-                    write!(f, "{}", item)?;
-                }
+                write!(f, ", {}", item)?;
             } else {
                 write!(f, "{}", item)?;
             }

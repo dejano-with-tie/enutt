@@ -78,7 +78,7 @@ impl std::fmt::Display for Message {
                 write!(f, "[{}]", self.name())
             }
             Message::Membership(peers) => {
-                write!(f, "[{}]({})", self.name(), SliceDisplay(peers, &true))
+                write!(f, "[{}]({})", self.name(), SliceDisplay(peers))
             }
             Message::Multicast(multicast) => {
                 write!(

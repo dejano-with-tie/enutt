@@ -1,30 +1,71 @@
 use std::cmp::min;
 use std::collections::{hash_map::Entry, HashMap, HashSet};
-use std::ops::Deref;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 use rand::rngs::ThreadRng;
 use rand::Rng;
+use tracing::info;
 
-use crate::node::{Peer, PeerId, PeerInner};
+use crate::node::{Address, NodeId, Peer, PeerId, PeerInner};
 use crate::ErrorKind;
 
 pub struct Membership {
+    // TODO: does it really need to be an arc?
     peers: Arc<RwLock<HashMap<PeerId, PeerInner>>>,
 }
 
 impl Membership {
-    pub fn add<'p>(&self, peer: &'p Peer) -> crate::Result<&'p Peer> {
+    pub fn new(node_id: &NodeId, addr: &Address) -> Self {
+        let mut peers = HashMap::new();
+        peers.insert(*node_id, PeerInner::new(addr.clone()));
+        Membership {
+            peers: Arc::new(RwLock::new(peers)),
+        }
+    }
+}
+
+impl Membership {
+    pub fn peers(&self) -> &Arc<RwLock<HashMap<PeerId, PeerInner>>> {
+        // if cfg!(not(test)) {
+        //     panic!("callable only from test case");
+        // }
+        &self.peers
+    }
+}
+
+impl Membership {
+    pub fn len(&self) -> usize {
+        self.peers.read().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.peers.read().is_empty()
+    }
+
+    pub fn peers_clone(&self) -> Vec<Peer> {
+        self.peers
+            .read()
+            .iter()
+            .map(|(id, p)| Peer::from((id, p)))
+            .collect()
+    }
+
+    pub fn add<'p>(&self, peer: Peer) -> crate::Result<Peer, ErrorKind> {
         let (id, inner) = peer.clone().into();
 
         match self.peers.write().entry(id) {
             Entry::Vacant(entry) => {
+                info!("new peer: {}", peer = peer);
                 entry.insert(inner);
                 Ok(peer)
             }
-            Entry::Occupied(_) => Err(ErrorKind::KnownMember((id, inner).into()).into()),
+            Entry::Occupied(_) => Err(ErrorKind::KnownMember((id, inner).into())),
         }
+    }
+
+    pub fn remove(&self, peer: &Peer) -> Option<PeerInner> {
+        self.peers.write().remove(peer.id())
     }
 
     pub fn random(&self, samples: usize, to_ignore: &HashSet<PeerId>) -> Option<Vec<Peer>> {

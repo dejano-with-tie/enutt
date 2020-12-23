@@ -1,29 +1,43 @@
-use tokio::sync::broadcast;
+use std::sync::Arc;
 
-/// Listens for the server shutdown signal.
-///
-/// Shutdown is signalled using a `broadcast::Receiver`. Only a single value is
-/// ever sent. Once a value has been sent via the broadcast channel, the server
-/// should shutdown.
-///
-/// The `Shutdown` struct listens for the signal and tracks that the signal has
-/// been received. Callers may query for whether the shutdown signal has been
-/// received or not.
-#[derive(Debug)]
+use crate::cluster::Context;
+use crate::message::{Message, Multicast};
+use crate::node::Peer;
+use crate::ErrorKind;
+use tracing::{info_span, info};
+use tracing_futures::Instrument;
+use tokio::sync::oneshot::{Sender, Receiver};
+
+/// Listens for app shutdown signal.
 pub(crate) struct Shutdown {
     /// `true` if the shutdown signal has been received
     shutdown: bool,
+    ctx: Arc<Context>,
+    rx: Receiver<()>,
+    result_tx: Sender<Result<(), ErrorKind>>,
+}
 
-    /// The receive half of the channel used to listen for shutdown.
-    notify: broadcast::Receiver<()>,
+// TODO: Try to do this with traits
+// let each struct interested in this event to implement Shutdown trait
+pub async fn listen(ctx: Arc<Context>, notify: Receiver<()>) -> Receiver<Result<(), ErrorKind>> {
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<(), ErrorKind>>();
+    
+    let shutdown = Shutdown::new(ctx, notify, result_tx);
+    
+    tokio::spawn(shutdown.on_shutdown().instrument(info_span!("shutdown")));
+
+    result_rx
 }
 
 impl Shutdown {
-    /// Create a new `Shutdown` backed by the given `broadcast::Receiver`.
-    pub(crate) fn new(notify: broadcast::Receiver<()>) -> Shutdown {
-        Shutdown {
+    /// Create a new `Shutdown` backed by the given `oneshot::Receiver`.
+    pub(crate) fn new(ctx: Arc<Context>, rx: Receiver<()>, result_tx: Sender<Result<(), ErrorKind>>) -> Self {
+        
+        Self {
             shutdown: false,
-            notify,
+            ctx,
+            rx,
+            result_tx,
         }
     }
 
@@ -33,17 +47,24 @@ impl Shutdown {
     }
 
     /// Receive the shutdown notice, waiting if necessary.
-    pub(crate) async fn recv(&mut self) {
-        // If the shutdown signal has already been received, then return
-        // immediately.
-        if self.shutdown {
-            return;
-        }
-
-        // Cannot receive a "lag error" as only one value is ever sent.
-        let _ = self.notify.recv().await;
-
-        // Remember that the signal has been received.
+    pub(crate) async fn on_shutdown(mut self) {
+        self.rx.await.unwrap();
+        
         self.shutdown = true;
+            // TODO: do bi_send leave
+        self.ctx
+            .gossip()
+            .queue(Multicast::with_payload(Message::Leave(Peer::from(
+                self.ctx.node().as_ref(),
+            ))));
+
+        // random sleep, maybe later on provide a gossip response
+        tokio::time::delay_for(tokio::time::Duration::from_secs(5)).await;
+
+        // TODO: Persist HQ peers
+
+        // shutdown.notify();
+        // tx.send(Ok(()));
+        self.result_tx.send(Ok(())).unwrap();
     }
 }

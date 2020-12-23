@@ -10,12 +10,7 @@ use crate::{ErrorKind, Result};
 
 pub async fn handle(ctx: Arc<Context>, send: &mut SendStream, peer: Peer) -> Result<()> {
     // respond with membership list
-    let peers = {
-        let peers = ctx.node().peers().read();
-        peers.iter().map(|(id, p)| Peer::from((id, p))).collect()
-    };
-
-    let message = Message::Membership(peers);
+    let message = Message::Membership(ctx.membership().peers_clone());
 
     match message.write(send).await {
         Ok(_) => {}
@@ -29,16 +24,15 @@ pub async fn handle(ctx: Arc<Context>, send: &mut SendStream, peer: Peer) -> Res
     }
 
     // let h = std::collections::
-    match ctx.add_peer(peer) {
+    match ctx.membership().add(peer) {
         Err(ErrorKind::KnownMember(_)) => {
             // don't gossip if it is a known member
         }
         Err(e) => return Err(e.into()),
         Ok(peer) => {
             // gossip about new join
-            ctx.gossip_tx()
-                .send(Multicast::with_payload(Message::Join(peer)))
-                .unwrap();
+            ctx.gossip()
+                .queue(Multicast::with_payload(Message::Join(peer)));
         }
     }
 

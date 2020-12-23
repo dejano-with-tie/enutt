@@ -1,23 +1,16 @@
-use std::collections::HashMap;
-use std::convert::TryFrom;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
-use futures::future::err;
-use futures::stream::FuturesUnordered;
-use futures::StreamExt;
 use futures::{Future, FutureExt};
 use parking_lot::{Mutex, RawMutex};
 use quinn::{Endpoint, NewConnection, RecvStream, SendStream};
-use tokio::sync::mpsc::{Sender, UnboundedSender};
-use tokio::sync::Notify;
+use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender};
 use tracing::{error, info, info_span, instrument, warn};
-use tracing_futures::Instrument;
-use uuid::Uuid;
 
 use crate::client::Client;
 use crate::config::{Config, ConfigBuilder};
 use crate::connection::ConnectionHolder;
+use crate::gossip::GossipQueue;
+use crate::membership::Membership;
 use crate::message::{Message, Multicast};
 use crate::node::{Address, Peer, PeerInner};
 use crate::{Error, ErrorKind, Id};
@@ -29,18 +22,21 @@ pub struct Cluster {
     context: Arc<Context>,
     client_cfg: quinn::ClientConfig,
     server_cfg: quinn::ServerConfig,
-    shutdown_tx: Sender<()>,
-    shutdown_handle: Arc<Notify>,
+    shutdown: (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<Result<(), ErrorKind>>,
+    ),
 }
 
 /// Holds shared state
 /// TODO: Maybe rename this to shared?
 pub struct Context {
+    membership: Arc<Membership>,
     config: Config,
     // TODO: Do we actually need Membership struct here?
     node: Arc<Node>,
     /// every part of app should be able to gossip
-    gossip_tx: UnboundedSender<Multicast>,
+    gossip: GossipQueue,
     /// every part of app should be able to communicate over quic
     client: Arc<Client>,
 }
@@ -53,43 +49,15 @@ impl Context {
         &self.node
     }
 
-    pub fn gossip_tx(&self) -> &UnboundedSender<Multicast> {
-        &self.gossip_tx
+    pub fn gossip(&self) -> &GossipQueue {
+        &self.gossip
     }
 
     pub fn client(&self) -> &Arc<Client> {
         &self.client
     }
-
-    // TODO: Clean this up with ENTRY thing
-    pub fn add_peer(&self, peer: Peer) -> std::result::Result<Peer, ErrorKind> {
-        let rd = self.node.peers().read();
-        if rd.get_key_value(&peer.id()).is_some() {
-            return Err(ErrorKind::KnownMember(peer));
-        }
-        drop(rd);
-
-        let mut wr = self.node.peers().write();
-        if wr.insert(*peer.id(), peer.inner().clone()).is_some() {
-            return Err(ErrorKind::Unexpected(
-                "context error; unable to add new peer".into(),
-            ));
-        }
-
-        drop(wr);
-
-        info!("new peer: {}", peer = peer);
-        Ok(Peer::from(
-            self.node()
-                .peers()
-                .read()
-                .get_key_value(&peer.id())
-                .unwrap(),
-        ))
-    }
-    pub fn remove(&self, peer: Peer) -> Option<PeerInner> {
-        let mut peers = self.node.peers().write();
-        peers.remove(peer.id())
+    pub fn membership(&self) -> &Arc<Membership> {
+        &self.membership
     }
 }
 
@@ -107,60 +75,59 @@ impl Cluster {
 
         // discover who I am
         let address = Address(format!("127.0.0.1:{}", config.app_port()));
-        let node = Arc::new(Node::new(Id::default(), address, HashMap::new()));
+        let node = Arc::new(Node::new(Id::default(), address));
+        let membership = Arc::new(Membership::new(&node.id(), node.address()));
 
         // discover nat capabilities
 
         // gossip _task_
-        let gossip_tx = crate::gossip::run(config.gossip(), Arc::clone(&client), Arc::clone(&node));
+        let gossip = crate::gossip::run(
+            config.gossip(),
+            Arc::clone(&client),
+            Arc::clone(&node),
+            Arc::clone(&membership),
+        );
 
         // configure context
         let context = Arc::new(Context {
+            membership: Arc::clone(&membership),
             config,
-            gossip_tx,
+            gossip,
             node: Arc::clone(&node),
             client: Arc::clone(&client),
         });
 
         // shutdown
-        // TODO: This is bs, improve (no idea how atm)
-        let shutdown = Arc::new(Notify::new());
-        let shutdown_handle = shutdown.clone();
-
-        let ctx_shutdown = Arc::clone(&context);
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(5);
-        tokio::spawn(async move {
-            if let Some(()) = shutdown_rx.recv().await {
-                // TODO: do bi_send leave
-                ctx_shutdown
-                    .gossip_tx
-                    .send(Multicast::with_payload(Message::Leave(Peer::from(
-                        ctx_shutdown.node().as_ref(),
-                    ))))
-                    .unwrap();
-
-                // random sleep, maybe later on provide a gossip response
-                tokio::time::delay_for(tokio::time::Duration::from_secs(5)).await;
-                shutdown.notify();
-            }
-        });
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let shutdown_result = crate::shutdown::listen(Arc::clone(&context), shutdown_rx).await;
 
         // return api which is exposing send bi/uni/udp messages
         Ok(Self {
             context: Arc::clone(&context),
             client_cfg,
             server_cfg,
-            shutdown_tx,
-            shutdown_handle,
+            shutdown: (shutdown_tx, shutdown_result),
         })
     }
 
-    pub async fn shutdown(&mut self) {
-        println!("sending shutdown signal");
-        self.shutdown_tx.send(()).await.unwrap();
-        // TODO: here add oneshot channel to await shutdown success
-        self.shutdown_handle.notified().await;
-        println!("received shutdown response");
+    pub async fn shutdown(self) -> Result<(), ErrorKind> {
+        info!("Shutting down gracefully");
+
+        self.shutdown.0.send(()).unwrap();
+
+        match self.shutdown.1.await.unwrap() {
+            Ok(_) => {
+                info!("successful shutdown");
+                Ok(())
+            }
+            Err(e) => {
+                error!(
+                    "failed to shutdown gracefully; reason: {reason}",
+                    reason = e
+                );
+                Err(ErrorKind::BootstrapFailure)
+            }
+        }
     }
 
     /// 1. Run server task
@@ -211,7 +178,7 @@ impl Cluster {
         return match response {
             Message::Membership(peers) => {
                 peers.into_iter().for_each(|peer| {
-                    if let Err(err) = self.context.add_peer(peer) {
+                    if let Err(err) = self.context.membership.add(peer) {
                         warn!("failed: {:?}", err)
                     }
                 });
@@ -259,8 +226,5 @@ impl Cluster {
     pub fn context(&self) -> &Arc<Context> {
         // cfg!(test)
         &self.context
-    }
-    pub fn shutdown_handle(&self) -> &Arc<Notify> {
-        &self.shutdown_handle
     }
 }

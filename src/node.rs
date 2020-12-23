@@ -109,19 +109,11 @@ pub struct Node {
     id: NodeId,
     // has to be behind lock as well; what will happened if contact address change because of NAT?
     address: Address,
-    /// TODO: Dedicate separate struct for peers (membership)
-    peers: RwLock<HashMap<NodeId, PeerInner>>,
 }
 
 impl Node {
-    pub fn new(id: NodeId, address: Address, peers: HashMap<PeerId, PeerInner>) -> Self {
-        let peers = RwLock::new(peers);
-
-        let mut w = peers.write();
-        w.insert(id, PeerInner::new(address.clone()));
-        drop(w);
-
-        Node { id, address, peers }
+    pub fn new(id: NodeId, address: Address) -> Self {
+        Node { id, address }
     }
 
     pub fn id(&self) -> NodeId {
@@ -129,8 +121,5 @@ impl Node {
     }
     pub fn address(&self) -> &Address {
         &self.address
-    }
-    pub fn peers(&self) -> &RwLock<HashMap<PeerId, PeerInner>> {
-        &self.peers
     }
 }
