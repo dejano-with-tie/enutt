@@ -6,9 +6,9 @@ use std::net::SocketAddr;
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::{ErrorKind, Id};
-use uuid::Uuid;
 
 /// Represents _node_ address by which it can be reached over the network.
 /// Atm it is just a string but later on should be expanded to contain necessary info
@@ -67,6 +67,18 @@ impl From<&Node> for Peer {
 impl From<(&PeerId, &PeerInner)> for Peer {
     fn from(entry: (&PeerId, &PeerInner)) -> Self {
         Peer(*entry.0, entry.1.clone())
+    }
+}
+
+impl From<(PeerId, PeerInner)> for Peer {
+    fn from(t: (PeerId, PeerInner)) -> Self {
+        Peer(t.0, t.1)
+    }
+}
+
+impl From<Peer> for (PeerId, PeerInner) {
+    fn from(peer: Peer) -> Self {
+        (peer.0, peer.1)
     }
 }
 

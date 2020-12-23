@@ -6,7 +6,9 @@ use std::fmt::Formatter;
 use std::sync::Arc;
 
 use futures::StreamExt;
-use parking_lot::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
+use parking_lot::{
+    MappedRwLockReadGuard, RwLock, RwLockReadGuard, RwLockUpgradableReadGuard, RwLockWriteGuard,
+};
 use rand::rngs::ThreadRng;
 use rand::Rng;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -16,7 +18,7 @@ use tracing_futures::Instrument;
 use crate::client::Client;
 use crate::connection::ConnectionHolder;
 use crate::message::{Message, Multicast, MulticastId};
-use crate::node::{Node, Peer, PeerId, PeerInner};
+use crate::node::{Address, Node, Peer, PeerId, PeerInner};
 use crate::SliceDisplay;
 
 /// Wrap `Multicast` message with `hop_count`
@@ -60,6 +62,7 @@ pub fn run(
         sender,
         client,
         // TODO: move this to separate struct
+        // TODO: Do a priority queue here! REALLY DO THIS ONE
         queue: RwLock::new(vec![]),
         seen: RwLock::new(vec![]),
         fanout: cfg.fanout(),
@@ -142,13 +145,13 @@ impl Gossip {
     /// To improve selection of random peers, `infected` list is passed on with message so next
     /// peer won't gossip to already infected peers.
     fn cycle(self: &Arc<Self>, cycle_rate: usize) {
-        let mut lock = self.queue.write();
+        let mut messages = self.queue.write();
         // remove messages which have been sent > _cycle_count_ times
-        lock.retain(|multicast| multicast.cycle_cnt() < cycle_rate);
+        messages.retain(|multicast| multicast.cycle_cnt() < cycle_rate);
 
-        let lock = RwLockWriteGuard::downgrade_to_upgradable(lock);
+        let messages = RwLockWriteGuard::downgrade_to_upgradable(messages);
         // select random peers to gossip to
-        let rnd_peers: HashMap<MulticastId, Option<Arc<Vec<Peer>>>> = lock
+        let rnd_peers: HashMap<MulticastId, Option<Arc<Vec<Peer>>>> = messages
             .iter()
             .map(|multicast| {
                 let peers = match self.random_peers(multicast.message.infected()) {
@@ -159,9 +162,9 @@ impl Gossip {
             })
             .collect();
 
-        let mut lock = RwLockUpgradableReadGuard::upgrade(lock);
+        let mut messages = RwLockUpgradableReadGuard::upgrade(messages);
         // inc hop count and update infected
-        lock.iter_mut().for_each(|multicast| {
+        messages.iter_mut().for_each(|multicast| {
             // we increase hop count even if there are no nodes to which we could gossip to
             // Another way to do it would be to increase only when it is sent to someone else
             // but do also time based deletion (message can expire + hop_count_limit)
@@ -174,9 +177,12 @@ impl Gossip {
             }
         });
 
+        // NOTE: Micro optimization: When queue is too big, do a piggyback of messages. The question is, what is too large?
+        // nm_messages = queue_size * fanout;
+        // - queue_size * fanout >=
         // gossip
-        let lock = RwLockWriteGuard::downgrade(lock);
-        lock.iter().for_each(|multicast| {
+        let messages = RwLockWriteGuard::downgrade(messages);
+        messages.iter().for_each(|multicast| {
             if let Some(peers) = rnd_peers.get(multicast.message.id()).unwrap() {
                 info!(
                     "execute {}; targets {}",
@@ -199,21 +205,20 @@ impl Gossip {
     pub fn multicast(&self, multicast: &Multicast, peers: &Arc<Vec<Peer>>) {
         let multicast = multicast.clone();
         // send actual message
-        let peers_to_msg = Arc::clone(peers);
+        let peers = Arc::clone(peers);
         let client = Arc::clone(&self.client);
         tokio::spawn(async move {
-            let messages =
-                futures::stream::iter(peers_to_msg.iter()).for_each_concurrent(None, |peer| {
-                    // TODO: This cloning is madness
-                    let multicast = multicast.clone();
-                    let client = Arc::clone(&client);
-                    async move {
-                        client
-                            .send_uni(peer.inner().address(), &Message::Multicast(multicast))
-                            .await
-                            .unwrap();
-                    }
-                });
+            let messages = futures::stream::iter(peers.iter()).for_each_concurrent(None, |peer| {
+                // NOTE: This cloning is madness
+                let multicast = multicast.clone();
+                let client = Arc::clone(&client);
+                async move {
+                    client
+                        .send_uni(peer.inner().address(), &Message::Multicast(multicast))
+                        .await
+                        .unwrap();
+                }
+            });
 
             messages.await
         });

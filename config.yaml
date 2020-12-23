@@ -5,5 +5,5 @@ network:
     - 127.0.0.1:8081
 gossip:
   fanout: 4
-  frequency: 200
+  frequency: 2000
   rate: 2

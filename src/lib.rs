@@ -10,6 +10,7 @@ pub mod cluster;
 pub mod config;
 pub mod connection;
 pub mod gossip;
+pub mod membership;
 pub mod message;
 pub mod node;
 pub mod server;

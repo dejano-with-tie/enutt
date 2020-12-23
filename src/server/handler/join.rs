@@ -28,6 +28,7 @@ pub async fn handle(ctx: Arc<Context>, send: &mut SendStream, peer: Peer) -> Res
         Err(e) => error!("failed to send message; {}", e),
     }
 
+    // let h = std::collections::
     match ctx.add_peer(peer) {
         Err(ErrorKind::KnownMember(_)) => {
             // don't gossip if it is a known member

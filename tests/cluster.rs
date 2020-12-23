@@ -43,7 +43,7 @@ async fn join() -> enutt::Result<()> {
     let peers = bootstrap_peers(expected_peers).await?;
 
     // give them few seconds to gossip
-    tokio::time::delay_for(tokio::time::Duration::from_secs(2)).await;
+    tokio::time::delay_for(tokio::time::Duration::from_secs(5)).await;
 
     // validate membership lists
     peers.into_iter().enumerate().for_each(|(_i, peer)| {

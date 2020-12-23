@@ -85,7 +85,7 @@ struct Store {
     id_gen: IdGen,
 }
 
-// Unique key identifying a connection. Two connections will always have distict keys even if they
+// Unique key identifying a connection. Two connections will always have distinct keys even if they
 // have the same socket address.
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 struct Key {
