@@ -1,15 +1,14 @@
-use std::collections::{BTreeMap, HashMap};
-use std::convert::TryFrom;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use futures::AsyncWriteExt;
 use parking_lot::Mutex;
-use quinn::{ClientConfig, Endpoint, RecvStream, SendStream};
+use quinn::{RecvStream, SendStream};
 use tracing::{debug, info, instrument, warn};
-use tracing_futures::Instrument as _;
 
 use crate::message::Message;
-use crate::node::Address;
+use crate::Error;
 
 // Pool for keeping open connections. Pooled connections are associated with a `ConnectionRemover`
 // which can be used to remove them from the pool.
@@ -125,51 +124,65 @@ pub struct ConnectionHolder {
 
 impl ConnectionHolder {
     #[instrument(name = "client-connection", skip(connection, remover))]
-    pub fn new(connection: quinn::Connection, remover: ConnectionRemover) -> crate::Result<Self> {
-        Ok(Self {
+    pub fn new(connection: quinn::Connection, remover: ConnectionRemover) -> Self {
+        Self {
             connection,
             remover,
-        })
+        }
     }
 
     fn remove_on_err<T, E>(&self, result: Result<T, E>) -> Result<T, E> {
         if result.is_err() {
-            self.remover.remove()
+            self.remover.remove();
+            // self.close();
         }
-        result
+
+        result.map_err(|e| e.into())
     }
 
-    /// Gracefully close connection immediatelly
+    fn remove_on_err_1<T>(&self, result: Result<T, crate::message::Error>) -> Result<T, Error> {
+        match result {
+            Err(crate::message::Error::ConnectionClosed(e)) => {
+                self.close();
+                return Err(e.into());
+            }
+            Err(_) => self.remover.remove(),
+            Ok(ref _r) => {}
+        };
+
+        result.map_err(|e| e.into())
+    }
+
+    /// Gracefully close connection immediately
     pub fn close(&self) {
-        self.connection.close(0u32.into(), b"");
         self.remover.remove();
+        self.connection.close(0u32.into(), b"");
     }
 
     pub async fn send_bi(&mut self, message: &Message) -> crate::Result<(SendStream, RecvStream)> {
-        // we called connect_to before this so it is alright to unwrap
         let (mut send, recv) = self.remove_on_err(self.connection.open_bi().await)?;
 
-        message.write(&mut send).await?;
-
-        if send.finish().await.is_err() {
-            warn!("failed to finish stream gracefully");
-        };
-
-        // self.endpoint.wait_idle().await;
+        self.write(message, &mut send).await?;
 
         Ok((send, recv))
     }
-    pub async fn send_uni(&mut self, message: &Message) -> crate::Result<SendStream> {
+
+    pub async fn send_uni(&mut self, message: &Message) -> crate::Result<()> {
         let mut send = self.remove_on_err(self.connection.open_uni().await)?;
 
-        message.write(&mut send).await?;
+        self.write(message, &mut send).await?;
 
-        if send.finish().await.is_err() {
-            warn!("failed to finish stream gracefully");
-        };
+        self.remove_on_err(send.finish().await)?;
 
-        // self.endpoint.wait_idle().await;
+        Ok(())
+    }
 
-        Ok(send)
+    async fn write(&mut self, message: &Message, send: &mut SendStream) -> crate::Result<()> {
+        if let Err(crate::message::Error::ConnectionClosed(e)) = message.write(send).await {
+            self.close();
+            return Err(e.into());
+        }
+
+        Ok(())
     }
 }

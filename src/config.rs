@@ -1,31 +1,38 @@
+use std::time::Duration;
+
 use config::FileFormat;
 use serde::Deserialize;
 
 use crate::node::Address;
-use crate::ErrorKind;
-use std::time::Duration;
+use crate::Error;
 
 pub static CERT_DOMAIN_NAME: &str = "enutt";
 
-fn new_transport_cfg(
+pub fn new_transport_cfg(
     idle_timeout_msec: u64,
     keep_alive_interval_msec: u32,
 ) -> quinn::TransportConfig {
     let mut transport_config = quinn::TransportConfig::default();
+    // NOTE: Initial rtt (and later pto() (sampled rtt)) is used as lower bound for timeout
+    // now + 3 * cmp::max(self.pto(), 2 * self.config.initial_rtt),
+    // transport_config.initial_rtt(Duration::from_millis(10));
+
     let _ = transport_config
+        // NOTE: used as upper bound. If lower then initial_rtt, will be ignored
         .max_idle_timeout(Some(Duration::from_millis(idle_timeout_msec)))
-        .map_err(|e| ErrorKind::Configuration(e.to_string()))
+        .map_err(|e| Error::Configuration(e.to_string()))
         .unwrap_or(&mut Default::default());
     let _ = transport_config
         .keep_alive_interval(Some(Duration::from_millis(keep_alive_interval_msec.into())));
     transport_config
 }
-
+// TODO: define protocols
 pub mod client {
     use std::sync::Arc;
 
+    use quinn::{ClientConfig, TransportConfig};
+
     use crate::config::new_transport_cfg;
-    use quinn::ClientConfig;
 
     /// Dummy certificate verifier that treats any certificate as valid.
     pub(crate) struct SkipServerVerification;
@@ -43,9 +50,11 @@ pub mod client {
     }
 
     /// Configure client to trust any certificate
-    pub fn insecure() -> ClientConfig {
-        let mut cfg = quinn::ClientConfigBuilder::default().build();
-        cfg.transport = Arc::new(new_transport_cfg(30_000, 10_000));
+    pub fn insecure(transport_cfg: TransportConfig) -> ClientConfig {
+        let mut builder = quinn::ClientConfigBuilder::default();
+        builder.enable_0rtt();
+        let mut cfg = builder.build();
+        cfg.transport = Arc::new(transport_cfg);
 
         // Get a mutable reference to the 'crypto' config in the 'client config'..
         let tls_cfg: &mut rustls::ClientConfig = Arc::get_mut(&mut cfg.crypto).unwrap();
@@ -60,10 +69,12 @@ pub mod client {
 }
 
 pub mod server {
+    use std::sync::Arc;
+
     use quinn::{Certificate, CertificateChain, PrivateKey, ServerConfig, ServerConfigBuilder};
 
     use crate::config::{new_transport_cfg, CERT_DOMAIN_NAME};
-    use std::sync::Arc;
+    use crate::Error;
 
     /// Returns default server configuration along with its certificate.
     pub fn self_signed() -> crate::Result<(ServerConfig, Vec<u8>)> {
@@ -76,10 +87,13 @@ pub mod server {
 
         let mut cfg_builder = ServerConfigBuilder::new(config);
 
-        cfg_builder.certificate(
-            CertificateChain::from_certs(vec![Certificate::from_der(&cert_der)?]),
-            PrivateKey::from_der(&priv_key)?,
-        )?;
+        cfg_builder
+            .certificate(
+                CertificateChain::from_certs(vec![Certificate::from_der(&cert_der)
+                    .map_err(|e| Error::Configuration(e.to_string()))?]),
+                PrivateKey::from_der(&priv_key).map_err(|e| Error::Configuration(e.to_string()))?,
+            )
+            .map_err(|e| Error::Configuration(e.to_string()))?;
 
         Ok((cfg_builder.build(), cert_der))
     }
@@ -92,6 +106,7 @@ pub struct Config {
     app_port: u16,
     network: Network,
     gossip: Gossip,
+    swim: Swim,
 }
 
 impl Config {
@@ -103,6 +118,9 @@ impl Config {
     }
     pub fn gossip(&self) -> &Gossip {
         &self.gossip
+    }
+    pub fn swim(&self) -> &Swim {
+        &self.swim
     }
 }
 
@@ -136,6 +154,21 @@ impl Gossip {
     }
 }
 
+#[derive(Deserialize)]
+pub struct Swim {
+    k: usize,
+    initial_rtt: u64,
+}
+
+impl Swim {
+    pub fn k(&self) -> usize {
+        self.k
+    }
+    pub fn initial_rtt(&self) -> u64 {
+        self.initial_rtt
+    }
+}
+
 /// Config builder
 /// Provide setters for optional fields
 pub struct ConfigBuilder {
@@ -165,11 +198,13 @@ impl Default for ConfigBuilder {
 }
 
 impl ConfigBuilder {
-    pub fn finish(&self) -> Result<Config, config::ConfigError> {
+    pub fn finish(&self) -> Result<Config, Error> {
         let mut s = config::Config::default();
 
-        s.merge(config::File::with_name("config").format(FileFormat::Yaml))?
-            .merge(config::Environment::with_prefix("app"))?;
+        s.merge(config::File::with_name("config").format(FileFormat::Yaml))
+            .map_err(|e| Error::Configuration(e.to_string()))?
+            .merge(config::Environment::with_prefix("app"))
+            .map_err(|e| Error::Configuration(e.to_string()))?;
 
         if let Some(port) = self.port {
             s.set("app_port", port as i64).unwrap();
@@ -177,12 +212,13 @@ impl ConfigBuilder {
 
         // println!("{:?}", s.get_table("network"));
         if let Some(ref boot_peers) = self.bootstrap_peers {
-            s.set("network.bootstrap_nodes", boot_peers.clone())?;
+            s.set("network.bootstrap_nodes", boot_peers.clone())
+                .map_err(|e| Error::Configuration(e.to_string()))?;
         }
 
         let config: Result<Config, config::ConfigError> = s.try_into();
 
-        config
+        config.map_err(|e| Error::Configuration(e.to_string()))
     }
 }
 

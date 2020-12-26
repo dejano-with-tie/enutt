@@ -111,7 +111,7 @@ async fn leave() -> enutt::Result<()> {
 
     let to_shutdown = peers.remove(0);
 
-    to_shutdown.shutdown().await?;
+    to_shutdown.shutdown();
 
     // give them few secs to gossip
     tokio::time::delay_for(tokio::time::Duration::from_secs(1)).await;

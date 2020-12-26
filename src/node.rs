@@ -8,7 +8,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{ErrorKind, Id};
+use crate::{Error, Id};
 
 /// Represents _node_ address by which it can be reached over the network.
 /// Atm it is just a string but later on should be expanded to contain necessary info
@@ -23,13 +23,13 @@ impl Display for Address {
 }
 
 impl TryFrom<&Address> for SocketAddr {
-    type Error = crate::ErrorKind;
+    type Error = crate::Error;
 
     fn try_from(value: &Address) -> Result<Self, Self::Error> {
         value
             .0
             .parse::<SocketAddr>()
-            .map_err(|e| ErrorKind::Unexpected(e.to_string()))
+            .map_err(|e| Error::Unexpected(e.to_string()))
     }
 }
 
@@ -116,8 +116,8 @@ impl Node {
         Node { id, address }
     }
 
-    pub fn id(&self) -> NodeId {
-        self.id
+    pub fn id(&self) -> &NodeId {
+        &self.id
     }
     pub fn address(&self) -> &Address {
         &self.address

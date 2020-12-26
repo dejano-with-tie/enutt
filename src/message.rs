@@ -14,10 +14,11 @@ use crate::{Id, SliceDisplay};
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("expected header size: {0}; actual header: {1:?}")]
+    #[error("header write failed. Expected header size: {0}; actual header: {1:?}")]
     HeaderWrite(u32, MessageHeader),
-    #[error("[{0:?}] {0}")]
-    HeaderRead(crate::Error),
+
+    #[error("header read failed")]
+    HeaderRead,
 
     #[error("(De)Serialization failed; [{0:?}] {0}")]
     DeSerialize(#[from] bincode::Error),
@@ -27,8 +28,11 @@ pub enum Error {
     #[error("Failed to read from stream; [{0:?}] {0}")]
     StreamRead(#[from] quinn::ReadExactError),
 
+    #[error("Connection closed: {0}")]
+    ConnectionClosed(#[from] quinn::ConnectionError),
+
     #[error("[{0:?}] {0}")]
-    Other(crate::Error),
+    Io(#[from] std::io::Error),
 }
 
 /// Total length of message header in bytes
@@ -58,29 +62,41 @@ pub struct MessageHeader {
 /// Messages that are sent over the wire
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Message {
+    // membership
     Join(Peer),
     Leave(Peer),
-    Ping,
     Membership(Vec<Peer>),
-    Multicast(Multicast),
+    // Swim
+    Ping,
+    Ack,
+    PingReq(Peer),
+    PingReqAck(Peer),
+    Alive(Peer),
+    Suspect(Peer),
+    Failed(Peer),
+    // gossip wrapper
+    Disseminate(Multicast),
 }
 
 impl std::fmt::Display for Message {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Message::Join(peer) => {
+            Message::Leave(peer)
+            | Message::Alive(peer)
+            | Message::Join(peer)
+            | Message::Suspect(peer)
+            | Message::Failed(peer)
+            | Message::PingReq(peer)
+            | Message::PingReqAck(peer) => {
                 write!(f, "[{}]({})", self.name(), peer.inner().address())
             }
-            Message::Leave(peer) => {
-                write!(f, "[{}]({})", self.name(), peer.inner().address())
-            }
-            Message::Ping => {
+            Message::Ping | Message::Ack => {
                 write!(f, "[{}]", self.name())
             }
             Message::Membership(peers) => {
                 write!(f, "[{}]({})", self.name(), SliceDisplay(peers))
             }
-            Message::Multicast(multicast) => {
+            Message::Disseminate(multicast) => {
                 write!(
                     f,
                     "[{}](id: {}, payload: {})",
@@ -171,7 +187,13 @@ impl Message {
             Message::Leave(_) => 2,
             Message::Ping => 3,
             Message::Membership(_) => 4,
-            Message::Multicast(_) => 5,
+            Message::Disseminate(_) => 5,
+            Message::Suspect(_) => 6,
+            Message::Alive(_) => 7,
+            Message::Ack => 8,
+            Message::PingReq(_) => 9,
+            Message::PingReqAck(_) => 10,
+            Message::Failed(_) => 11,
         }
     }
     /// For displaying purposes
@@ -181,7 +203,13 @@ impl Message {
             Message::Leave(_) => "LEAVE",
             Message::Ping => "PING",
             Message::Membership(_) => "MEMBERSHIP",
-            Message::Multicast(_) => "MULTICAST",
+            Message::Disseminate(_) => "DISSEMINATE",
+            Message::Suspect(_) => "SUSPECT",
+            Message::Alive(_) => "ALIVE",
+            Message::Ack => "ACK",
+            Message::PingReq(_) => "PING_REQ",
+            Message::PingReqAck(_) => "PING_REQ_ACK",
+            Message::Failed(_) => "FAILED",
         }
     }
 
@@ -202,7 +230,7 @@ impl Message {
 
         stream.write_all(&header_bytes).await?;
         stream.write_all(&message_bytes).await?;
-        stream.flush().await.map_err(|e| Error::Other(e.into()))?;
+        stream.flush().await?;
 
         Ok(())
     }
@@ -226,7 +254,7 @@ impl Message {
 
         let header: MessageHeader = header_bytes
             .read_with(&mut 0, byte::BE)
-            .map_err(move |_e| Error::HeaderRead("Message header read failed".into()))?;
+            .map_err(move |_e| Error::HeaderRead)?;
 
         let mut message_bytes = vec![0; header.len];
         stream.read_exact(&mut message_bytes).await?;

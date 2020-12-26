@@ -4,15 +4,15 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 use rand::rngs::ThreadRng;
+use rand::seq::SliceRandom;
 use rand::Rng;
 use tracing::info;
 
 use crate::node::{Address, NodeId, Peer, PeerId, PeerInner};
-use crate::ErrorKind;
+use crate::Error;
 
 pub struct Membership {
-    // TODO: does it really need to be an arc?
-    peers: Arc<RwLock<HashMap<PeerId, PeerInner>>>,
+    peers: RwLock<HashMap<PeerId, PeerInner>>,
 }
 
 impl Membership {
@@ -20,13 +20,13 @@ impl Membership {
         let mut peers = HashMap::new();
         peers.insert(*node_id, PeerInner::new(addr.clone()));
         Membership {
-            peers: Arc::new(RwLock::new(peers)),
+            peers: RwLock::new(peers),
         }
     }
 }
 
 impl Membership {
-    pub fn peers(&self) -> &Arc<RwLock<HashMap<PeerId, PeerInner>>> {
+    pub fn peers(&self) -> &RwLock<HashMap<PeerId, PeerInner>> {
         // if cfg!(not(test)) {
         //     panic!("callable only from test case");
         // }
@@ -51,7 +51,13 @@ impl Membership {
             .collect()
     }
 
-    pub fn add<'p>(&self, peer: Peer) -> crate::Result<Peer, ErrorKind> {
+    pub fn shuffled(&self) -> Vec<Peer> {
+        let mut shuffled = self.peers_clone();
+        shuffled.shuffle(&mut ThreadRng::default());
+        shuffled
+    }
+
+    pub fn add<'p>(&self, peer: Peer) -> crate::Result<Peer, Error> {
         let (id, inner) = peer.clone().into();
 
         match self.peers.write().entry(id) {
@@ -60,12 +66,16 @@ impl Membership {
                 entry.insert(inner);
                 Ok(peer)
             }
-            Entry::Occupied(_) => Err(ErrorKind::KnownMember((id, inner).into())),
+            Entry::Occupied(_) => Err(Error::KnownMember((id, inner).into())),
         }
     }
 
     pub fn remove(&self, peer: &Peer) -> Option<PeerInner> {
-        self.peers.write().remove(peer.id())
+        let removed = self.peers.write().remove(peer.id());
+        if removed.is_some() {
+            info!("remove peer: {}", peer = peer);
+        }
+        removed
     }
 
     pub fn random(&self, samples: usize, to_ignore: &HashSet<PeerId>) -> Option<Vec<Peer>> {
@@ -126,7 +136,7 @@ mod tests {
         }
 
         let membership = Membership {
-            peers: Arc::new(RwLock::new(peers)),
+            peers: RwLock::new(peers),
         };
 
         let samples = membership.random(4, &HashSet::new());

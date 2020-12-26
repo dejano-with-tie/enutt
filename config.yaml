@@ -7,3 +7,6 @@ gossip:
   fanout: 4
   frequency: 200
   rate: 2
+swim:
+  initial_rtt: 1000
+  k: 2

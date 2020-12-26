@@ -4,44 +4,44 @@ use futures::{Future, FutureExt};
 use parking_lot::{Mutex, RawMutex};
 use quinn::{Endpoint, NewConnection, RecvStream, SendStream};
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender};
+use tokio::sync::{watch, Notify};
 use tracing::{error, info, info_span, instrument, warn};
 
 use crate::client::Client;
-use crate::config::{Config, ConfigBuilder};
+use crate::config::{new_transport_cfg, Config, ConfigBuilder};
 use crate::connection::ConnectionHolder;
-use crate::gossip::GossipQueue;
+use crate::gossip::DisseminationQueue;
 use crate::membership::Membership;
 use crate::message::{Message, Multicast};
 use crate::node::{Address, Peer, PeerInner};
-use crate::{Error, ErrorKind, Id};
+use crate::{Error, Id};
 
 use super::node::Node;
 use super::Result;
 
 pub struct Cluster {
-    context: Arc<Context>,
+    context: Arc<Shared>,
     client_cfg: quinn::ClientConfig,
     server_cfg: quinn::ServerConfig,
-    shutdown: (
-        tokio::sync::oneshot::Sender<()>,
-        tokio::sync::oneshot::Receiver<Result<(), ErrorKind>>,
-    ),
+    shutdown_notify: Arc<Notify>,
 }
 
 /// Holds shared state
 /// TODO: Maybe rename this to shared?
-pub struct Context {
+/// TODO: Improvement: Context/Shared should be Arc and everything inside without Arc
+/// Reasoning: Will have to maintain only one atomic reference for Arc<Context>
+pub struct Shared {
     membership: Arc<Membership>,
     config: Config,
     // TODO: Do we actually need Membership struct here?
     node: Arc<Node>,
     /// every part of app should be able to gossip
-    gossip: GossipQueue,
+    gossip: DisseminationQueue,
     /// every part of app should be able to communicate over quic
     client: Arc<Client>,
 }
 
-impl Context {
+impl Shared {
     pub fn config(&self) -> &Config {
         &self.config
     }
@@ -49,7 +49,7 @@ impl Context {
         &self.node
     }
 
-    pub fn gossip(&self) -> &GossipQueue {
+    pub fn gossip(&self) -> &DisseminationQueue {
         &self.gossip
     }
 
@@ -64,7 +64,7 @@ impl Context {
 impl Cluster {
     pub async fn new(config: Config) -> Result<Self> {
         // configure client
-        let client_cfg = crate::config::client::insecure();
+        let client_cfg = crate::config::client::insecure(new_transport_cfg(30_000, 10_000));
 
         // configure server
         let (server_cfg, _cert) = crate::config::server::self_signed()?;
@@ -89,7 +89,7 @@ impl Cluster {
         );
 
         // configure context
-        let context = Arc::new(Context {
+        let context = Arc::new(Shared {
             membership: Arc::clone(&membership),
             config,
             gossip,
@@ -97,42 +97,35 @@ impl Cluster {
             client: Arc::clone(&client),
         });
 
+        // swim _task_
+        let _ = crate::swim::run(context.config.swim(), context.clone());
+
         // shutdown
+        let notify = Arc::new(tokio::sync::Notify::new());
+
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let shutdown_result = crate::shutdown::listen(Arc::clone(&context), shutdown_rx).await;
+        crate::shutdown::listen(Arc::clone(&context), notify.clone()).await;
 
         // return api which is exposing send bi/uni/udp messages
-        Ok(Self {
+        let cluster = Self {
             context: Arc::clone(&context),
             client_cfg,
             server_cfg,
-            shutdown: (shutdown_tx, shutdown_result),
-        })
+            shutdown_notify: notify,
+        };
+
+        Ok(cluster)
     }
 
-    pub async fn shutdown(self) -> Result<(), ErrorKind> {
+    pub fn shutdown(self) {
         info!("Shutting down gracefully");
 
-        self.shutdown.0.send(()).unwrap();
-
-        match self.shutdown.1.await.unwrap() {
-            Ok(_) => {
-                info!("successful shutdown");
-                Ok(())
-            }
-            Err(e) => {
-                error!(
-                    "failed to shutdown gracefully; reason: {reason}",
-                    reason = e
-                );
-                Err(ErrorKind::BootstrapFailure)
-            }
-        }
+        self.shutdown_notify.notify();
     }
 
     /// 1. Run server task
     /// 2. Join cluster
-    pub async fn bootstrap(&self) -> Result<(), ErrorKind> {
+    pub async fn bootstrap(&self) -> Result<(), Error> {
         // setup nat _task_, UPnP
 
         // setup server _task_
@@ -141,7 +134,7 @@ impl Cluster {
             .await
             .map_err(|e| {
                 error!("failed: {reason}", reason = e);
-                ErrorKind::BootstrapFailure
+                Error::BootstrapFailure
             })?;
 
         // join
@@ -154,7 +147,7 @@ impl Cluster {
         Ok(())
     }
 
-    async fn join(&self) -> crate::Result<(), crate::ErrorKind> {
+    async fn join(&self) -> crate::Result<(), crate::Error> {
         let bootstrap_nodes = self.context.config.network().bootstrap_nodes();
         let (mut connection, _bootstrap_node) = match self.connect_any(bootstrap_nodes).await? {
             None => return Ok(()),
@@ -165,13 +158,13 @@ impl Cluster {
         let (_, mut recv_stream) = connection
             .send_bi(&Message::Join(Peer::from(self.context.node.as_ref())))
             .await
-            .map_err(|_e| ErrorKind::BootstrapFailure)?;
+            .map_err(|_e| Error::BootstrapFailure)?;
 
         let response = Message::read(&mut recv_stream)
             .await
             .map_err(|e| {
                 error!("failed to join cluster: {reason}", reason = e);
-                ErrorKind::BootstrapFailure
+                Error::BootstrapFailure
             })?
             .unwrap();
 
@@ -186,7 +179,7 @@ impl Cluster {
             }
             _ => {
                 error!("failed to join cluster; bootstrap node responded with wrong message type");
-                return Err(ErrorKind::BootstrapFailure);
+                return Err(Error::BootstrapFailure);
             }
         };
     }
@@ -194,9 +187,9 @@ impl Cluster {
     async fn connect_any<'a>(
         &self,
         bootstrap_nodes: &'a [Address],
-    ) -> Result<Option<(ConnectionHolder, &'a Address)>, crate::ErrorKind> {
+    ) -> Result<Option<(ConnectionHolder, &'a Address)>, crate::Error> {
         if bootstrap_nodes.is_empty() {
-            return Err(ErrorKind::Configuration(
+            return Err(Error::Configuration(
                 "no known nodes; unable to bootstrap".into(),
             ));
         }
@@ -223,7 +216,7 @@ impl Cluster {
         }
     }
 
-    pub fn context(&self) -> &Arc<Context> {
+    pub fn context(&self) -> &Arc<Shared> {
         // cfg!(test)
         &self.context
     }

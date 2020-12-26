@@ -17,16 +17,19 @@ pub mod server;
 pub mod shutdown;
 pub mod swim;
 
-/// Error and Result type alias
-pub type Error = Box<dyn std::error::Error + Send + Sync>;
+/// Result type alias
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+/// Generic Error alias
 
 #[derive(thiserror::Error, Debug)]
-pub enum ErrorKind {
+pub enum Error {
     #[error("{0}")]
     Unexpected(String),
     #[error("{0}")]
-    UnexpectedSrc(Error),
+    UnexpectedSrc(#[from] Box<dyn std::error::Error + 'static + Send + Sync>),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
     #[error("Cluster bootstrap failed")]
     BootstrapFailure,
     #[error("Configuration: {0}")]
@@ -35,12 +38,18 @@ pub enum ErrorKind {
     KnownMember(Peer),
     #[error("Failed to shutdown gracefully")]
     ShutdownFailure,
-}
 
-impl From<Error> for ErrorKind {
-    fn from(e: Error) -> Self {
-        ErrorKind::UnexpectedSrc(e)
-    }
+    #[error("{0}")]
+    MessageIo(#[from] crate::message::Error),
+
+    #[error("Establishing connection: {0}")]
+    Connect(#[from] quinn::ConnectError),
+    #[error("Connection lost:{0}")]
+    Connection(#[from] quinn::ConnectionError),
+    #[error("Creating endpoint: {0}")]
+    Endpoint(#[from] quinn::EndpointError),
+    #[error("Stream write/close: {0}")]
+    StreamWrite(#[from] quinn::WriteError),
 }
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, Hash, Ord, PartialOrd, Eq, PartialEq)]
@@ -63,7 +72,7 @@ impl Display for Id<Uuid> {
         let str = string.as_str();
 
         let len = str.len();
-        // SAFETY: we know the size of `Uuid`
+        // Safety: we know the size of `Uuid`
         let first_part = unsafe { str.get_unchecked(0..4) };
         let second_part = unsafe { str.get_unchecked(len - 4..len) };
 
@@ -85,16 +94,5 @@ impl<'a, T: std::fmt::Display + 'a> std::fmt::Display for SliceDisplay<'a, T> {
             first = false;
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn id_display() {
-        let id = Id::default();
-        println!("{}", id);
     }
 }

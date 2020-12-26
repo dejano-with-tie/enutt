@@ -2,8 +2,7 @@ use tracing::{info, info_span, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use enutt::cluster::Cluster;
-use enutt::config::{Config, ConfigBuilder};
-use enutt::server;
+use enutt::config::ConfigBuilder;
 
 #[tokio::main]
 async fn main() -> enutt::Result<()> {
@@ -13,21 +12,7 @@ async fn main() -> enutt::Result<()> {
 
     let cluster = Cluster::new(ConfigBuilder::default().finish()?).await?;
 
-    // info!("bootstraping");
-
     cluster.bootstrap().await?;
-    // tokio::spawn(async {
-    //     if let Err(e) = server().await {
-    //         info!(?e);
-    //     }
-    // });
-
-    // tokio::spawn(async {
-    //     tokio::time::delay_for(tokio::time::Duration::from_secs(1)).await;
-    //     if let Err(e) = client("127.0.0.1:0").await {
-    //         info!(?e);
-    //     }
-    // });
 
     tokio::signal::ctrl_c().await?;
     info!("Got ctrl-c");

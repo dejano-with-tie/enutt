@@ -1,42 +1,34 @@
-use std::cmp::min;
-use std::collections::HashMap;
-use std::collections::HashSet;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
 use futures::StreamExt;
-use parking_lot::{
-    MappedRwLockReadGuard, RwLock, RwLockReadGuard, RwLockUpgradableReadGuard, RwLockWriteGuard,
-};
-use rand::rngs::ThreadRng;
-use rand::Rng;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use parking_lot::{RwLock, RwLockWriteGuard};
 use tracing::{debug, info, info_span, instrument, warn};
 use tracing_futures::Instrument;
 
 use crate::client::Client;
 use crate::membership::Membership;
 use crate::message::{Message, Multicast, MulticastId};
-use crate::node::{Node, NodeId, Peer, PeerId, PeerInner};
+use crate::node::{Node, NodeId, Peer};
 use crate::SliceDisplay;
 
 /// Wrap `Multicast` message with `hop_count`
-struct MulticastWrapper {
+struct DisseminationMessage {
     /// how many times this message has been gossiped
     pub cycle_cnt: usize,
     pub message: Multicast,
 }
 
-impl Display for MulticastWrapper {
+impl Display for DisseminationMessage {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "(c:{}) {}", self.cycle_cnt, self.message)
     }
 }
 
-impl MulticastWrapper {
+impl DisseminationMessage {
     pub fn new(message: Multicast) -> Self {
-        MulticastWrapper {
+        DisseminationMessage {
             cycle_cnt: Default::default(),
             message,
         }
@@ -49,29 +41,32 @@ impl MulticastWrapper {
     }
 }
 
-pub struct GossipQueue {
-    queue: Arc<RwLock<Vec<MulticastWrapper>>>,
+pub struct DisseminationQueue {
+    queue: Arc<RwLock<Vec<DisseminationMessage>>>,
     /// Already gossiped about these. Used for filtering when queueing new multicasts
     seen: RwLock<Vec<MulticastId>>,
     sender_id: NodeId,
 }
 
-impl GossipQueue {
+impl DisseminationQueue {
     /// Queue messages
     /// Every multicast has to go through this fn before it is queued
+    #[instrument(name = "dissemination", skip(self, multicast), fields(message = %multicast))]
     pub fn queue(&self, mut multicast: Multicast) {
         if self.is_seen(multicast.id()) {
-            warn!("skip; {}", multicast);
+            debug!("skip");
             return;
         }
 
-        info!("queue {}", multicast);
+        info!("queue");
         self.mark_as_seen(*multicast.id());
 
         // we are infected now
         multicast.insert_infected(self.sender_id);
 
-        self.queue.write().push(MulticastWrapper::new(multicast));
+        self.queue
+            .write()
+            .push(DisseminationMessage::new(multicast));
     }
 
     pub fn peek(&mut self) {}
@@ -94,8 +89,8 @@ pub fn run(
     client: Arc<Client>,
     sender: Arc<Node>,
     membership: Arc<Membership>,
-) -> GossipQueue {
-    let gossip = Arc::new(Gossip {
+) -> DisseminationQueue {
+    let gossip = Gossip {
         membership,
         client,
         // TODO: move this to separate struct
@@ -104,12 +99,12 @@ pub fn run(
         fanout: cfg.fanout(),
         cycle_frequency: cfg.frequency(),
         cycle_rate: cfg.rate(),
-    });
+    };
 
-    let gossip_queue = GossipQueue {
+    let gossip_queue = DisseminationQueue {
         seen: RwLock::new(vec![]),
         queue: Arc::clone(&gossip.queue),
-        sender_id: sender.id(),
+        sender_id: *sender.id(),
     };
 
     // run gossip protocol
@@ -121,7 +116,7 @@ pub fn run(
 pub struct Gossip {
     membership: Arc<Membership>,
     /// To gossip about in next cycle
-    queue: Arc<RwLock<Vec<MulticastWrapper>>>,
+    queue: Arc<RwLock<Vec<DisseminationMessage>>>,
     /// Quic client
     client: Arc<Client>,
     fanout: usize,
@@ -130,7 +125,7 @@ pub struct Gossip {
 }
 /// Implements simple gossip based protocol
 impl Gossip {
-    pub async fn run(self: &Arc<Self>) -> crate::Result<()> {
+    pub async fn run(&self) -> crate::Result<()> {
         let mut cycle_interval =
             tokio::time::interval(std::time::Duration::from_millis(self.cycle_frequency));
         loop {
@@ -156,7 +151,7 @@ impl Gossip {
     ///
     /// To improve selection of random peers, `infected` list is passed on with message so next
     /// peer won't gossip to already infected peers.
-    fn cycle(self: &Arc<Self>, cycle_rate: usize) {
+    fn cycle(&self, cycle_rate: usize) {
         let mut messages = self.queue.write();
         // remove messages which have been sent > _cycle_count_ times
         messages.retain(|multicast| multicast.cycle_cnt() < cycle_rate);
@@ -179,7 +174,7 @@ impl Gossip {
                 .membership
                 .random(self.fanout, multicast.message.infected())
             {
-                info!("execute {}; targets {}", multicast, SliceDisplay(&peers));
+                debug!("execute {}; targets {}", multicast, SliceDisplay(&peers));
                 self.multicast(&multicast.message, &Arc::new(peers))
             };
         });
@@ -196,10 +191,12 @@ impl Gossip {
                 let multicast = multicast.clone();
                 let client = Arc::clone(&client);
                 async move {
-                    client
-                        .send_uni(peer.inner().address(), &Message::Multicast(multicast))
+                    if let Err(e) = client
+                        .send_uni(peer.inner().address(), &Message::Disseminate(multicast))
                         .await
-                        .unwrap();
+                    {
+                        debug!("failed to multicast; {}", e);
+                    }
                 }
             });
 
