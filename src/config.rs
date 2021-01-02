@@ -6,11 +6,9 @@ use serde::Deserialize;
 use crate::node::Address;
 use crate::Error;
 
-pub static CERT_DOMAIN_NAME: &str = "enutt";
-
 pub fn new_transport_cfg(
     idle_timeout_msec: u64,
-    keep_alive_interval_msec: u32,
+    keep_alive_interval_msec: u64,
 ) -> quinn::TransportConfig {
     let mut transport_config = quinn::TransportConfig::default();
     // NOTE: Initial rtt (and later pto() (sampled rtt)) is used as lower bound for timeout
@@ -22,8 +20,8 @@ pub fn new_transport_cfg(
         .max_idle_timeout(Some(Duration::from_millis(idle_timeout_msec)))
         .map_err(|e| Error::Configuration(e.to_string()))
         .unwrap_or(&mut Default::default());
-    let _ = transport_config
-        .keep_alive_interval(Some(Duration::from_millis(keep_alive_interval_msec.into())));
+    let _ =
+        transport_config.keep_alive_interval(Some(Duration::from_millis(keep_alive_interval_msec)));
     transport_config
 }
 // TODO: define protocols
@@ -31,8 +29,6 @@ pub mod client {
     use std::sync::Arc;
 
     use quinn::{ClientConfig, TransportConfig};
-
-    use crate::config::new_transport_cfg;
 
     /// Dummy certificate verifier that treats any certificate as valid.
     pub(crate) struct SkipServerVerification;
@@ -73,17 +69,17 @@ pub mod server {
 
     use quinn::{Certificate, CertificateChain, PrivateKey, ServerConfig, ServerConfigBuilder};
 
-    use crate::config::{new_transport_cfg, CERT_DOMAIN_NAME};
+    use crate::config::{new_transport_cfg, Quic};
     use crate::Error;
 
     /// Returns default server configuration along with its certificate.
-    pub fn self_signed() -> crate::Result<(ServerConfig, Vec<u8>)> {
-        let cert = rcgen::generate_simple_self_signed(vec![CERT_DOMAIN_NAME.into()]).unwrap();
+    pub fn self_signed(cfg: &Quic) -> crate::Result<(ServerConfig, Vec<u8>)> {
+        let cert = rcgen::generate_simple_self_signed(vec![cfg.cert_domain_name.clone()]).unwrap();
         let cert_der = cert.serialize_der().unwrap();
         let priv_key = cert.serialize_private_key_der();
 
         let mut config = ServerConfig::default();
-        config.transport = Arc::new(new_transport_cfg(30_000, 10_000));
+        config.transport = Arc::new(new_transport_cfg(cfg.timeout, cfg.keep_alive));
 
         let mut cfg_builder = ServerConfigBuilder::new(config);
 
@@ -103,16 +99,15 @@ pub mod server {
 /// These are config details for the application
 #[derive(Deserialize)]
 pub struct Config {
-    app_port: u16,
+    quic: Quic,
+    server: Server,
+    client: Client,
     network: Network,
     gossip: Gossip,
     swim: Swim,
 }
 
 impl Config {
-    pub fn app_port(&self) -> u16 {
-        self.app_port
-    }
     pub fn network(&self) -> &Network {
         &self.network
     }
@@ -122,6 +117,33 @@ impl Config {
     pub fn swim(&self) -> &Swim {
         &self.swim
     }
+    pub fn server(&self) -> &Server {
+        &self.server
+    }
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+    pub fn quic(&self) -> &Quic {
+        &self.quic
+    }
+}
+
+#[derive(Deserialize)]
+pub struct Quic {
+    pub timeout: u64,
+    pub keep_alive: u64,
+    pub cert_domain_name: String,
+}
+
+#[derive(Deserialize)]
+pub struct Server {
+    pub port: u16,
+}
+
+#[derive(Deserialize)]
+pub struct Client {
+    pub port: u16,
+    pub port_random: bool,
 }
 
 #[derive(Deserialize)]
@@ -212,10 +234,9 @@ impl ConfigBuilder {
             .map_err(|e| Error::Configuration(e.to_string()))?;
 
         if let Some(port) = self.port {
-            s.set("app_port", port as i64).unwrap();
+            s.set("server.port", port as i64).unwrap();
         }
 
-        // println!("{:?}", s.get_table("network"));
         if let Some(ref boot_peers) = self.bootstrap_peers {
             s.set("network.bootstrap_nodes", boot_peers.clone())
                 .map_err(|e| Error::Configuration(e.to_string()))?;
@@ -235,7 +256,7 @@ mod tests {
     fn when_default_read_from_file() {
         let config = ConfigBuilder::default().finish().unwrap();
 
-        assert_eq!(8081 as u16, config.app_port());
+        assert_eq!(8081 as u16, config.server().port);
         assert_eq!(
             &vec![Address("127.0.0.1:8081".into())],
             config.network().bootstrap_nodes()
@@ -245,10 +266,10 @@ mod tests {
     #[test]
     fn change_port_with_env_var() {
         let new_port = "123";
-        std::env::set_var("app_app_port", new_port);
+        std::env::set_var("app_server.port", new_port);
         let config = ConfigBuilder::default().finish().unwrap();
 
-        assert_eq!(123 as u16, config.app_port());
+        assert_eq!(123 as u16, config.server().port);
         assert_eq!(
             &vec![Address("127.0.0.1:8081".into())],
             config.network().bootstrap_nodes()
@@ -258,7 +279,7 @@ mod tests {
     #[test]
     fn builder() {
         let changed_port = ConfigBuilder::default().port(444).finish().unwrap();
-        assert_eq!(444 as u16, changed_port.app_port());
+        assert_eq!(444 as u16, changed_port.server().port);
         assert_eq!(
             &vec![Address("127.0.0.1:8081".into())],
             changed_port.network().bootstrap_nodes()
@@ -268,7 +289,7 @@ mod tests {
             .bootstrap_peers(vec!["192.168.0.1:8081".into()])
             .finish()
             .unwrap();
-        assert_eq!(8081 as u16, replaced_boot_peers.app_port());
+        assert_eq!(8081 as u16, replaced_boot_peers.server().port);
         assert_eq!(
             &vec![Address("192.168.0.1:8081".into())],
             replaced_boot_peers.network().bootstrap_nodes()
@@ -279,7 +300,7 @@ mod tests {
             .bootstrap_peers(vec!["192.168.0.2:8081".into()])
             .finish()
             .unwrap();
-        assert_eq!(4141 as u16, full_builder.app_port());
+        assert_eq!(4141 as u16, full_builder.server().port);
         assert_eq!(
             &vec![Address("192.168.0.2:8081".into())],
             full_builder.network().bootstrap_nodes()

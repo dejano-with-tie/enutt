@@ -24,7 +24,7 @@ pub async fn run(ctx: Arc<Shared>, cfg: ServerConfig) -> Result<()> {
 
     let address = SocketAddr::try_from(ctx.membership().me().address()).map_err(|e| {
         error!("unable to parse ip addr; source = {source}", source = e);
-        Error::BootstrapFailure
+        Error::Bootstrap
     })?;
 
     let (endpoint, incoming) = match endpoint.bind(&address) {

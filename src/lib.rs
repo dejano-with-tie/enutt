@@ -30,13 +30,11 @@ pub enum Error {
     Io(#[from] std::io::Error),
 
     #[error("Cluster bootstrap failed")]
-    BootstrapFailure,
+    Bootstrap,
     #[error("Configuration: {0}")]
     Configuration(String),
-    #[error("Known member: {0:?}")]
-    KnownMember(Peer),
     #[error("Failed to shutdown gracefully")]
-    ShutdownFailure,
+    Shutdown,
 
     #[error("{0}")]
     MessageIo(#[from] crate::message::Error),

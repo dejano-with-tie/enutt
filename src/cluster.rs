@@ -21,7 +21,6 @@ use super::Result;
 
 pub struct Cluster {
     context: Arc<Shared>,
-    client_cfg: quinn::ClientConfig,
     server_cfg: quinn::ServerConfig,
     shutdown_notify: Arc<Notify>,
 }
@@ -56,52 +55,44 @@ impl Shared {
 }
 
 impl Cluster {
-    pub async fn new(config: Config) -> Result<Self> {
-        // configure client
-        let client_cfg = crate::config::client::insecure(new_transport_cfg(30_000, 10_000));
-
+    pub async fn new(cfg: Config) -> Result<Self> {
         // configure server
-        let (server_cfg, _cert) = crate::config::server::self_signed()?;
+        let (server_cfg, _cert) = crate::config::server::self_signed(cfg.quic())?;
 
-        // client
+        // configure client
         // TODO: Handle parsing of bootstrap ip/port in one place
-        let client = Arc::new(Client::new(client_cfg.clone())?);
+        let client = Arc::new(Client::new(cfg.quic(), cfg.client())?);
 
         // discover who I am
-        let address = Address(format!("127.0.0.1:{}", config.app_port()));
+        let address = Address(format!("127.0.0.1:{}", cfg.server().port));
         let node = Node::new(Id::default(), address);
-        let membership = Membership::new(node, &config.gossip());
+        let membership = Membership::new(node, cfg.gossip());
 
         // discover nat capabilities
 
         // gossip _task_
-        let gossip = crate::gossip::run(
-            config.gossip(),
-            Arc::clone(&client),
-            Arc::clone(&membership),
-        );
+        let gossip = crate::gossip::run(cfg.gossip(), Arc::clone(&client), Arc::clone(&membership));
 
         // configure context
-        let context = Arc::new(Shared {
+        let shared = Arc::new(Shared {
             membership: Arc::clone(&membership),
-            config,
+            config: cfg,
             gossip,
             client: Arc::clone(&client),
         });
 
         // swim _task_
-        let _ = crate::membership::swim::run(context.config.swim(), context.clone());
+        let _ = crate::membership::swim::run(shared.config.swim(), shared.clone());
 
         // shutdown
         let notify = Arc::new(tokio::sync::Notify::new());
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        crate::shutdown::listen(Arc::clone(&context), notify.clone()).await;
+        crate::shutdown::listen(Arc::clone(&shared), notify.clone()).await;
 
         // return api which is exposing send bi/uni/udp messages
         let cluster = Self {
-            context: Arc::clone(&context),
-            client_cfg,
+            context: Arc::clone(&shared),
             server_cfg,
             shutdown_notify: notify,
         };
@@ -126,7 +117,7 @@ impl Cluster {
             .await
             .map_err(|e| {
                 error!("failed: {reason}", reason = e);
-                Error::BootstrapFailure
+                Error::Bootstrap
             })?;
 
         // join
@@ -150,13 +141,13 @@ impl Cluster {
         let (_, mut recv_stream) = connection
             .send_bi(&Message::Join(Peer::from(self.context.membership.me())))
             .await
-            .map_err(|_e| Error::BootstrapFailure)?;
+            .map_err(|_e| Error::Bootstrap)?;
 
         let response = Message::read(&mut recv_stream)
             .await
             .map_err(|e| {
                 error!("failed to join cluster: {reason}", reason = e);
-                Error::BootstrapFailure
+                Error::Bootstrap
             })?
             .unwrap();
 
@@ -169,7 +160,7 @@ impl Cluster {
             }
             _ => {
                 error!("failed to join cluster; bootstrap node responded with wrong message type");
-                return Err(Error::BootstrapFailure);
+                return Err(Error::Bootstrap);
             }
         };
     }

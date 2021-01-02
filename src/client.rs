@@ -5,6 +5,7 @@ use quinn::{ClientConfig, Endpoint, RecvStream, SendStream};
 use tokio::net::UdpSocket;
 use tracing::info;
 
+use crate::config::{new_transport_cfg, Quic};
 use crate::connection::{ConnectionHolder, ConnectionPool};
 use crate::message::Message;
 use crate::node::Address;
@@ -18,17 +19,24 @@ enum Endp {
 pub struct Client {
     connection_pool: ConnectionPool,
     endpoint: Endpoint,
+    cert_domain_name: String,
 }
 
 impl Client {
-    pub fn new(cfg: ClientConfig) -> crate::Result<Self> {
+    pub fn new(quic_cfg: &crate::config::Quic, cfg: &crate::config::Client) -> crate::Result<Self> {
+        let client_cfg = crate::config::client::insecure(new_transport_cfg(
+            quic_cfg.timeout,
+            quic_cfg.keep_alive,
+        ));
         let mut endpoint_builder = Endpoint::builder();
-        endpoint_builder.default_client_config(cfg);
+        endpoint_builder.default_client_config(client_cfg);
 
-        // let OS decide about port
-        // TODO: Provide config for local address and boolean flag allow_random_port, use it here instead of hardcoded val
+        let port = match cfg.port_random {
+            true => 0,
+            false => cfg.port,
+        };
         let (endpoint, _) = endpoint_builder.bind(
-            &"127.0.0.1:0"
+            &format!("127.0.0.1:{}", port)
                 .parse::<SocketAddr>()
                 .map_err(|e| Error::UnexpectedSrc(Box::new(e)))?,
         )?;
@@ -37,6 +45,7 @@ impl Client {
         Ok(Self {
             connection_pool: ConnectionPool::new(),
             endpoint,
+            cert_domain_name: quic_cfg.cert_domain_name.clone(),
         })
     }
 
@@ -56,7 +65,7 @@ impl Client {
         // allow multiple connections to same addr. See connection id in ConnectionPool struct
         let connecting = self
             .endpoint
-            .connect(&addr, crate::config::CERT_DOMAIN_NAME)?;
+            .connect(&addr, self.cert_domain_name.as_str())?;
         let quinn::NewConnection { connection, .. } = connecting.await?;
 
         let remover = self.connection_pool.insert(addr, connection.clone());
@@ -76,59 +85,5 @@ impl Client {
     ) -> crate::Result<(SendStream, RecvStream)> {
         let mut connection = self.connect_to(addr).await?;
         connection.send_bi(message).await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::convert::TryFrom;
-    use std::time::Duration;
-
-    use quinn::{ConnectError, ConnectionError, Endpoint};
-
-    use crate::client::Client;
-    use crate::config::new_transport_cfg;
-    use crate::node::Address;
-    use crate::Error;
-
-    #[tokio::test]
-    pub async fn connection_timeout() {
-        const TIMEOUT_MSEC: Duration = Duration::from_millis(200);
-        let cfg = crate::config::client::insecure(new_transport_cfg(200, 1));
-        let client = Client::new(cfg).unwrap();
-
-        let invalid_addr = Address("127.0.0.1:1".into());
-
-        let now = std::time::Instant::now();
-        let dt = now.elapsed();
-        match client.connect_to(&invalid_addr).await {
-            Err(Error::Connection(ConnectionError::TimedOut)) => {
-                println!("failed with timeout")
-            }
-            Err(e) => panic!("Unexpected error: {}", e),
-            Ok(_) => panic!("Unexpected success"),
-        }
-
-        assert!(dt >= TIMEOUT_MSEC && dt <= TIMEOUT_MSEC + Duration::from_millis(10));
-
-        println!("elapsed: {}", dt.as_millis());
-    }
-
-    #[tokio::test]
-    pub async fn connect_within_timeout() {
-        let mut endpoint = Endpoint::builder();
-        endpoint.listen(crate::config::server::self_signed().unwrap().0);
-
-        let recv_addr = Address("127.0.0.1:9010".into());
-        let _ = endpoint
-            .bind(&std::net::SocketAddr::try_from(&recv_addr).unwrap())
-            .unwrap();
-
-        const TIMEOUT_MSEC: Duration = Duration::from_millis(200);
-        let cfg = crate::config::client::insecure(new_transport_cfg(200, 1));
-        let client = Client::new(cfg).unwrap();
-        if let Err(e) = client.connect_to(&recv_addr).await {
-            panic!("Unexpected error: {}", e)
-        }
     }
 }

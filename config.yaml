@@ -1,6 +1,13 @@
-app_port: 8081
+quic:
+  timeout: 30000
+  keep_alive: 10000
+  cert_domain_name: enutt
+client:
+  port: 10100
+  port_random: true
+server:
+  port: 8081
 network:
-  cert_name: enutt
   bootstrap_nodes:
     - 127.0.0.1:8081
 gossip:
