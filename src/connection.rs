@@ -8,7 +8,7 @@ use quinn::{RecvStream, SendStream};
 use tracing::{debug, info, instrument, warn};
 
 use crate::message::Message;
-use crate::Error;
+use crate::{Error, IdGen};
 
 // Pool for keeping open connections. Pooled connections are associated with a `ConnectionRemover`
 // which can be used to remove them from the pool.
@@ -101,17 +101,6 @@ impl Key {
     // Returns the maximal `Key` for the given address according to its `Ord` relation.
     fn max(addr: SocketAddr) -> Self {
         Self { addr, id: u64::MAX }
-    }
-}
-
-#[derive(Default)]
-struct IdGen(u64);
-
-impl IdGen {
-    fn next(&mut self) -> u64 {
-        let id = self.0;
-        self.0 = self.0.wrapping_add(1);
-        id
     }
 }
 

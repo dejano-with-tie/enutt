@@ -8,12 +8,12 @@ use tokio::sync::{watch, Notify};
 use tracing::{error, info, info_span, instrument, warn};
 
 use crate::client::Client;
-use crate::config::{new_transport_cfg, Config, ConfigBuilder};
+use crate::config::{new_transport_cfg, Config};
 use crate::connection::ConnectionHolder;
 use crate::gossip::DisseminationQueue;
-use crate::membership::Membership;
-use crate::message::{Message, Multicast};
-use crate::node::{Address, Peer, PeerInner};
+use crate::membership::{Membership, Peer};
+use crate::message::Message;
+use crate::node::Address;
 use crate::{Error, Id};
 
 use super::node::Node;
@@ -27,14 +27,11 @@ pub struct Cluster {
 }
 
 /// Holds shared state
-/// TODO: Maybe rename this to shared?
 /// TODO: Improvement: Context/Shared should be Arc and everything inside without Arc
 /// Reasoning: Will have to maintain only one atomic reference for Arc<Context>
 pub struct Shared {
     membership: Arc<Membership>,
     config: Config,
-    // TODO: Do we actually need Membership struct here?
-    node: Arc<Node>,
     /// every part of app should be able to gossip
     gossip: DisseminationQueue,
     /// every part of app should be able to communicate over quic
@@ -44,9 +41,6 @@ pub struct Shared {
 impl Shared {
     pub fn config(&self) -> &Config {
         &self.config
-    }
-    pub fn node(&self) -> &Arc<Node> {
-        &self.node
     }
 
     pub fn gossip(&self) -> &DisseminationQueue {
@@ -75,8 +69,8 @@ impl Cluster {
 
         // discover who I am
         let address = Address(format!("127.0.0.1:{}", config.app_port()));
-        let node = Arc::new(Node::new(Id::default(), address));
-        let membership = Arc::new(Membership::new(&node.id(), node.address()));
+        let node = Node::new(Id::default(), address);
+        let membership = Membership::new(node, &config.gossip());
 
         // discover nat capabilities
 
@@ -84,7 +78,6 @@ impl Cluster {
         let gossip = crate::gossip::run(
             config.gossip(),
             Arc::clone(&client),
-            Arc::clone(&node),
             Arc::clone(&membership),
         );
 
@@ -93,12 +86,11 @@ impl Cluster {
             membership: Arc::clone(&membership),
             config,
             gossip,
-            node: Arc::clone(&node),
             client: Arc::clone(&client),
         });
 
         // swim _task_
-        let _ = crate::swim::run(context.config.swim(), context.clone());
+        let _ = crate::membership::swim::run(context.config.swim(), context.clone());
 
         // shutdown
         let notify = Arc::new(tokio::sync::Notify::new());
@@ -156,7 +148,7 @@ impl Cluster {
 
         // Send _join_ message and update members
         let (_, mut recv_stream) = connection
-            .send_bi(&Message::Join(Peer::from(self.context.node.as_ref())))
+            .send_bi(&Message::Join(Peer::from(self.context.membership.me())))
             .await
             .map_err(|_e| Error::BootstrapFailure)?;
 
@@ -171,9 +163,7 @@ impl Cluster {
         return match response {
             Message::Membership(peers) => {
                 peers.into_iter().for_each(|peer| {
-                    if let Err(err) = self.context.membership.add(peer) {
-                        warn!("failed: {:?}", err)
-                    }
+                    self.context.membership.insert(peer);
                 });
                 Ok(())
             }
@@ -197,7 +187,7 @@ impl Cluster {
         // Attempt to connect to all nodes and return the first one to succeed
         let mut bootstrap_nodes = bootstrap_nodes
             .iter()
-            .filter(|addr| addr != &self.context.node.address())
+            .filter(|addr| addr != &self.context.membership.me().address())
             .take(1) // TODO: Only take first for now
             .peekable();
 

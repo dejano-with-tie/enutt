@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::node::{Peer, PeerId};
+use crate::membership::{Peer, PeerId};
 use crate::{Id, SliceDisplay};
 
 #[derive(Error, Debug)]
@@ -69,8 +69,8 @@ pub enum Message {
     // Swim
     Ping,
     Ack,
-    PingReq(Peer),
-    PingReqAck(Peer),
+    IndirectPing(Peer),
+    IndirectPingAck(Peer),
     Alive(Peer),
     Suspect(Peer),
     Failed(Peer),
@@ -86,8 +86,8 @@ impl std::fmt::Display for Message {
             | Message::Join(peer)
             | Message::Suspect(peer)
             | Message::Failed(peer)
-            | Message::PingReq(peer)
-            | Message::PingReqAck(peer) => {
+            | Message::IndirectPing(peer)
+            | Message::IndirectPingAck(peer) => {
                 write!(f, "[{}]({})", self.name(), peer.inner().address())
             }
             Message::Ping | Message::Ack => {
@@ -191,8 +191,8 @@ impl Message {
             Message::Suspect(_) => 6,
             Message::Alive(_) => 7,
             Message::Ack => 8,
-            Message::PingReq(_) => 9,
-            Message::PingReqAck(_) => 10,
+            Message::IndirectPing(_) => 9,
+            Message::IndirectPingAck(_) => 10,
             Message::Failed(_) => 11,
         }
     }
@@ -207,8 +207,8 @@ impl Message {
             Message::Suspect(_) => "SUSPECT",
             Message::Alive(_) => "ALIVE",
             Message::Ack => "ACK",
-            Message::PingReq(_) => "PING_REQ",
-            Message::PingReqAck(_) => "PING_REQ_ACK",
+            Message::IndirectPing(_) => "INDIRECT_PING",
+            Message::IndirectPingAck(_) => "INDIRECT_PING_ACK",
             Message::Failed(_) => "FAILED",
         }
     }
@@ -237,7 +237,7 @@ impl Message {
 
     /// Read message from given stream
     ///
-    /// Returns serialized `Message`, or `None` if stream has finished.
+    /// Returns serialized `Message` or `None` if stream has finished.
     pub async fn read(stream: &mut quinn::RecvStream) -> Result<Option<Self>, Error> {
         let mut header_bytes = [0u8; HEADER_MESSAGE_LEN];
 

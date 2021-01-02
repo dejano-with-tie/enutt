@@ -139,7 +139,7 @@ impl Network {
 pub struct Gossip {
     fanout: usize,
     frequency: u64,
-    rate: usize,
+    period_rate: usize,
 }
 
 impl Gossip {
@@ -149,15 +149,17 @@ impl Gossip {
     pub fn frequency(&self) -> u64 {
         self.frequency
     }
-    pub fn rate(&self) -> usize {
-        self.rate
+    pub fn period_rate(&self) -> usize {
+        self.period_rate
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Swim {
+    /// Number of peers to pick for indirect pinging
     k: usize,
     initial_rtt: u64,
+    period_rate: usize,
 }
 
 impl Swim {
@@ -166,6 +168,9 @@ impl Swim {
     }
     pub fn initial_rtt(&self) -> u64 {
         self.initial_rtt
+    }
+    pub fn period_rate(&self) -> usize {
+        self.period_rate
     }
 }
 

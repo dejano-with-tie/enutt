@@ -51,22 +51,20 @@ async fn join() -> enutt::Result<()> {
     // let bootstrap_node = bootstrap_node.context().membership();
     // let second = second.context().membership();
 
-    let bootstrap_node_id = bootstrap_node.node().id();
-    let second_id = second.node().id();
+    let bootstrap_node_id = bootstrap_node.membership().me().id();
+    let second_id = second.membership().me().id();
 
     // they know about each other
     {
         assert!(bootstrap_node
             .membership()
             .peers()
-            .read()
             .contains_key(&second_id));
     }
     {
         assert!(second
             .membership()
             .peers()
-            .read()
             .contains_key(&bootstrap_node_id));
     }
     Ok(())

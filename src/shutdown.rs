@@ -5,8 +5,8 @@ use tracing::{info, info_span};
 use tracing_futures::Instrument;
 
 use crate::cluster::Shared;
+use crate::membership::Peer;
 use crate::message::{Message, Multicast};
-use crate::node::Peer;
 use crate::Error;
 use tokio::sync::Notify;
 

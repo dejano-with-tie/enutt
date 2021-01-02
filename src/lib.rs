@@ -3,7 +3,7 @@ use std::fmt::{Display, Formatter};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::node::Peer;
+use membership::Peer;
 
 pub mod client;
 pub mod cluster;
@@ -15,7 +15,6 @@ pub mod message;
 pub mod node;
 pub mod server;
 pub mod shutdown;
-pub mod swim;
 
 /// Result type alias
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -50,6 +49,16 @@ pub enum Error {
     Endpoint(#[from] quinn::EndpointError),
     #[error("Stream write/close: {0}")]
     StreamWrite(#[from] quinn::WriteError),
+}
+
+#[derive(Default, Debug)]
+pub struct IdGen(u64);
+
+impl IdGen {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(1);
+        self.0
+    }
 }
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, Hash, Ord, PartialOrd, Eq, PartialEq)]

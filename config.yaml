@@ -6,7 +6,12 @@ network:
 gossip:
   fanout: 4
   frequency: 200
-  rate: 2
+  # period multiplier
+  period_rate: 2
 swim:
-  initial_rtt: 1000
+  initial_rtt: 500
+  # period multiplier (initial_rtt * period_rate)
+  # has to be at least 3x the initial_rtt
+  period_rate: 10
+  # Number of peers to pick for indirect pinging
   k: 2

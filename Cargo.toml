@@ -16,9 +16,12 @@ path = "bin/main.rs"
 futures = "0.3.8"
 tokio = { version = "0.2.24", features = ["full"] }
 # udp based protocol
-quinn = { version = "0.6.1", features = ["tls-rustls"] }
+# using git because rtt is not released yet
+#quinn = { version = "0.6.1", features = ["tls-rustls"] }
+quinn = { git = "https://github.com/quinn-rs/quinn", branch = "main", features = ["default"] }
 # needed by quinn
-rustls = { version = "0.17", features = ["quic", "dangerous_configuration"] }
+#rustls = { version = "0.16", features = ["quic", "dangerous_configuration"] }
+rustls = { git = "https://github.com/ctz/rustls", rev = "fee894f7e030", features = ["quic", "dangerous_configuration"] }
 rcgen = "0.8.9"
 webpki = { version = "0.21" }
 # serialize

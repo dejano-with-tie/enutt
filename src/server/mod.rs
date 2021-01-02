@@ -9,20 +9,20 @@ use quinn::{Connecting, Endpoint, Incoming, ServerConfig};
 use tracing::{debug, error, info, info_span, instrument, warn};
 use tracing_futures::Instrument as _;
 
+use crate::client::Client;
 use crate::cluster::Shared;
-use crate::message::Message;
+use crate::membership::{swim, Peer};
+use crate::message::{Message, Multicast};
 use crate::Error;
 
 use super::Result;
-
-pub mod handler;
 
 #[instrument(name = "server", skip(ctx, cfg))]
 pub async fn run(ctx: Arc<Shared>, cfg: ServerConfig) -> Result<()> {
     let mut endpoint = Endpoint::builder();
     endpoint.listen(cfg);
 
-    let address = SocketAddr::try_from(ctx.node().address()).map_err(|e| {
+    let address = SocketAddr::try_from(ctx.membership().me().address()).map_err(|e| {
         error!("unable to parse ip addr; source = {source}", source = e);
         Error::BootstrapFailure
     })?;
@@ -189,28 +189,33 @@ impl RequestHandler {
         };
 
         let payload = multicast.payload().clone();
-        self.ctx.gossip().queue(multicast);
 
-        match payload {
+        let multicast = match payload {
             Message::Join(peer) => {
-                self.ctx.membership().add(peer);
+                self.ctx.membership().insert(peer);
+                Some(multicast)
             }
             Message::Leave(peer) => {
-                self.ctx.membership().remove(&peer);
+                self.ctx.membership().remove(peer.id());
+                Some(multicast)
             }
             Message::Suspect(peer) => {
-                // TODO
-                self.ctx.membership().remove(&peer);
+                Some(swim::handle_suspect_msg(&self.ctx, peer).unwrap_or(multicast))
             }
             Message::Alive(peer) => {
-                // TODO
+                Some(swim::handle_alive_msg(&self.ctx, peer).unwrap_or(multicast))
             }
             Message::Failed(peer) => {
-                // TODO
-                self.ctx.membership().remove(&peer);
+                Some(swim::handle_failed_msg(&self.ctx, peer).unwrap_or(multicast))
             }
-            _ => {}
+
+            _ => Some(multicast),
+        };
+
+        if let Some(multicast) = multicast {
+            self.ctx.gossip().queue(multicast);
         }
+
         Ok(())
     }
 
@@ -221,12 +226,9 @@ impl RequestHandler {
         send: &mut quinn::SendStream,
     ) -> Result<()> {
         let response = match request {
-            Message::Join(peer) => handler::join::handle(Arc::clone(&self.ctx), peer)?,
+            Message::Join(peer) => handle_join(&self.ctx, peer)?,
             Message::Ping => Some(Message::Ack),
-            Message::PingReq(peer) => match crate::swim::ping(self.ctx.client(), &peer).await {
-                Ok(_) => Some(Message::PingReqAck(peer)),
-                Err(_) => None,
-            },
+            Message::IndirectPing(peer) => handle_indirect_ping(self.ctx.client(), peer).await,
             _ => {
                 error!("received UNKNOWN message: {message}", message = request);
                 return Ok(());
@@ -239,5 +241,25 @@ impl RequestHandler {
         }
 
         Ok(())
+    }
+}
+
+/// If joining peer is unknown, disseminate `Join` message
+///
+/// Return membership list to joining peer
+pub fn handle_join(shared: &Arc<Shared>, peer: Peer) -> Result<Option<Message>> {
+    if let Some(peer) = shared.membership().insert(peer) {
+        shared
+            .gossip()
+            .queue(Multicast::with_payload(Message::Join(peer)));
+    }
+
+    Ok(Some(Message::Membership(shared.membership().peers_clone())))
+}
+
+async fn handle_indirect_ping(client: &Client, peer: Peer) -> Option<Message> {
+    match swim::ping(client, &peer).await {
+        Ok(_) => Some(Message::IndirectPingAck(peer)),
+        Err(_) => None,
     }
 }
