@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use parking_lot::{RwLock, RwLockWriteGuard};
-use tracing::{debug, info_span, instrument, warn};
+use tracing::{debug, info, info_span, instrument, warn};
 use tracing_futures::Instrument;
 
 use crate::client::Client;
@@ -57,6 +57,9 @@ impl DisseminationQueue {
             debug!("skip");
             return;
         }
+        // micro optimizations:
+        // 1. if we got `swim::failed` msg to queue -> remove all other state msgs related to failed peer from queue
+        // because failed overrides all other states
 
         debug!("queue");
         self.mark_as_seen(*multicast.id());

@@ -7,37 +7,32 @@ use tracing_futures::Instrument;
 use crate::cluster::Shared;
 use crate::membership::Peer;
 use crate::message::{Message, Multicast};
-use crate::Error;
-use tokio::sync::Notify;
+use tokio::sync::broadcast;
 
 /// Listens for app shutdown signal.
-pub(crate) struct Shutdown {
+pub struct Shutdown {
     /// `true` if the shutdown signal has been received
     shutdown: bool,
-    ctx: Arc<Shared>,
-    notify: Arc<Notify>,
-}
-
-// TODO: Try to do this with traits
-// let each struct interested in this event to implement Shutdown trait
-pub async fn listen(ctx: Arc<Shared>, notify: Arc<Notify>) {
-    let shutdown = Shutdown::new(ctx, notify);
-    tokio::spawn(shutdown.on_shutdown().instrument(info_span!("shutdown")));
+    /// The receive half of the channel used to listen for shutdown.
+    notify: broadcast::Receiver<()>,
 }
 
 impl Shutdown {
     /// Create a new `Shutdown` backed by the given `oneshot::Receiver`.
-    pub(crate) fn new(ctx: Arc<Shared>, notify: Arc<Notify>) -> Self {
+    pub(crate) fn new(notify: broadcast::Receiver<()>) -> Self {
         Self {
             shutdown: false,
-            ctx,
             notify,
         }
     }
 
     /// Receive the shutdown notice, waiting if necessary.
-    pub(crate) async fn on_shutdown(mut self) {
-        self.notify.notified().await;
+    pub(crate) async fn recv(mut self) {
+        if self.shutdown {
+            return;
+        }
+
+        let _ = self.notify.recv().await;
 
         self.shutdown = true;
 

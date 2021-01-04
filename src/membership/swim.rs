@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use futures::{FutureExt, TryFutureExt};
-use tokio::time::{Duration, Instant};
-use tracing::{debug, debug_span, error};
+use tokio::time::{timeout, Duration, Instant};
+use tracing::{debug, error, info, info_span, warn};
 use tracing_futures::Instrument;
 
 use crate::client::Client;
@@ -33,9 +33,12 @@ pub fn run(cfg: &crate::config::Swim, shared: Arc<Shared>) {
     };
 
     tokio::spawn(disseminate_failure(share_fail));
-    tokio::spawn(async move {
-        swim.run().instrument(debug_span!("swim")).await;
-    });
+    tokio::spawn(
+        async move {
+            swim.run().await;
+        }
+        .instrument(info_span!("swim")),
+    );
 }
 
 /// Listen for membership component to announce peer failure and spread this info to the cluster
@@ -43,6 +46,7 @@ async fn disseminate_failure(ctx_failed: Arc<Shared>) {
     let mut failed = ctx_failed.membership().failed.subscribe();
     loop {
         if let Ok(failed) = failed.recv().await {
+            ctx_failed.client().close(failed.inner().address());
             ctx_failed
                 .gossip()
                 .queue(Multicast::with_payload(Message::Failed(failed)));
@@ -107,16 +111,19 @@ impl Swim {
     /// to the rest of the cluster.
     /// - If `ping` is successful (direct or indirect), mark peer as `alive` and disseminate info to the rest of the cluster.
     async fn probe_and_gossip(&self, peer: Peer) {
-        debug!("probe {}", peer);
-        let message = match tokio::time::timeout(self.protocol_period(), self.probe(&peer)).await {
+        info!("probe {}", peer);
+        let message = match timeout(self.protocol_period(), self.probe(&peer)).await {
             Ok(Ok(_)) => {
-                if self.shared.membership().is_suspected(peer.id()) {
+                if !self.shared.membership().is_suspected(peer.id()) {
+                    None
+                } else {
                     self.shared.membership().alive(peer.clone());
+                    Some(Multicast::with_payload(Message::Alive(peer)))
                 }
-                Some(Multicast::with_payload(Message::Alive(peer)))
             }
             Err(_) | Ok(Err(_)) => {
-                error!("probe failed");
+                error!("probe failed: {}", peer);
+                self.shared.client().close(peer.inner().address());
                 self.shared
                     .membership()
                     .suspect(peer)
@@ -130,11 +137,11 @@ impl Swim {
     }
 
     async fn probe(&self, to_probe: &Peer) -> crate::Result<(), Error> {
-        let ping_result =
-            match tokio::time::timeout(self.rtt(), ping(self.shared.client(), to_probe)).await {
-                Ok(_) => return Ok(()),
-                Err(_) => Err(Error::ProbeTimeout),
-            };
+        // NOTE: tokio timeout cancels the ping request and stream is not getting closed gracefully
+        let ping_result = match timeout(self.rtt(), ping(self.shared.client(), to_probe)).await {
+            Ok(_) => return Ok(()),
+            Err(_) => Err(Error::ProbeTimeout),
+        };
 
         let indirect_ping_requests = match self.indirect_ping(to_probe) {
             Some(requests) => requests,
@@ -215,6 +222,7 @@ pub fn handle_suspect_msg(shared: &Arc<Shared>, peer: Peer) -> Option<Multicast>
     let membership = shared.membership();
     let me = membership.me();
     if me.id() == peer.id() {
+        warn!("They are saying i'm failing :O");
         me.inc_incarnation();
         return Some(Multicast::with_payload(Message::Alive(Peer::from(me))));
     }
@@ -223,6 +231,7 @@ pub fn handle_suspect_msg(shared: &Arc<Shared>, peer: Peer) -> Option<Multicast>
     None
 }
 pub fn handle_failed_msg(shared: &Arc<Shared>, peer: Peer) -> Option<Multicast> {
+    shared.client().close(peer.inner().address());
     shared.membership().remove(peer.id());
     None
 }

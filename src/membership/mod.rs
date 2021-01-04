@@ -12,13 +12,13 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::Sender;
 use tokio::sync::Notify;
 use tokio::time::Instant;
-use tracing::{error, info, info_span};
+use tracing::{error, info, info_span, instrument};
 use tracing_futures::Instrument;
 use uuid::Uuid;
 
 use crate::config::Gossip;
 use crate::node::{Address, Node};
-use crate::{Id, IdGen};
+use crate::{Id, IdGen, SliceDisplay};
 
 pub mod swim;
 
@@ -98,7 +98,7 @@ impl Membership {
             async move {
                 purge(purge_instance).await;
             }
-            .instrument(info_span!("purge")),
+            .instrument(info_span!("membership:purge")),
         );
 
         instance
@@ -110,6 +110,7 @@ impl Membership {
     /// to `alive` state and return value will be `None`
     ///
     /// If provided peer is new peer, return value will be `Some(Peer)`
+    #[instrument(name = "membership:insert", skip(self), fields(peer = %peer))]
     pub fn insert(&self, peer: Peer) -> Option<Peer> {
         let (id, inner) = peer.into();
 
@@ -126,15 +127,17 @@ impl Membership {
         }
 
         let peer = Peer::from((id, inner));
-        info!("new peer: {}", peer);
+        info!("new peer");
         Some(peer)
     }
 
     /// Remove all traces for given peer
     ///
+    #[instrument(name = "membership:remove", skip(self), fields(peer_id = %peer_id))]
     pub fn remove(&self, peer_id: &PeerId) {
         let mut state = self.state.write();
         if let Some(peer) = state.peers.remove(peer_id) {
+            info!("peer leaving, remove");
             if let PeerState::Suspected(key) = peer.state {
                 state.suspected.remove(&key);
             }
@@ -156,6 +159,7 @@ impl Membership {
     ///
     /// If update is performed, return value will be `Some(peer)`
     /// If no action is performed, return value will be `None`
+    #[instrument(name = "membership:suspect", skip(self), fields(peer = %peer))]
     pub fn suspect(&self, peer: Peer) -> Option<Peer> {
         let i = peer.inner().incarnation;
         let (j, current_state) = {
@@ -199,6 +203,7 @@ impl Membership {
         let state = RwLockWriteGuard::downgrade(state);
 
         if updated && should_notify {
+            info!("suspected");
             drop(state);
             self.purge_task.notify();
         }
@@ -226,6 +231,7 @@ impl Membership {
     ///
     /// If update is performed, return value will be `Some(peer)`
     /// If no action is performed, return value will be `None`
+    #[instrument(name = "membership:alive", skip(self), fields(peer = %peer))]
     pub fn alive(&self, peer: Peer) -> Option<Peer> {
         let mut state = self.state.write();
         let existing = match state.peers.get_mut(peer.id()) {
@@ -245,6 +251,7 @@ impl Membership {
                 // change state to alive
                 existing.state = PeerState::Alive;
                 state.suspected.remove(&key);
+                info!("alive");
                 return Some(peer);
             }
             _ => {}
@@ -270,7 +277,7 @@ impl Membership {
     /// every peer * gossip frequency (ms)
     fn ttl(&self) -> Duration {
         let periods = crate::gossip::periods_to_spread(self.gossip_rate, self.len());
-        Duration::from_millis((periods as u64) * self.gossip_frequency)
+        Duration::from_millis((periods as u64) * self.gossip_frequency) + Duration::from_secs(20)
     }
 
     pub fn len(&self) -> usize {
@@ -378,6 +385,7 @@ fn purge_expired_keys(membership: &Arc<Membership>) -> Option<Instant> {
     let now = Instant::now();
 
     while let Some((&(when, id), peer_id)) = state.suspected.iter().next() {
+        info!("suspected peer: {}", peer_id);
         if when > now {
             // Done purging, `when` is the instant at which the next key
             // expires. The worker task will wait until this instant.
@@ -391,7 +399,7 @@ fn purge_expired_keys(membership: &Arc<Membership>) -> Option<Instant> {
             }
         }
 
-        error!("transition peer to FAILED state {:?}", id);
+        info!("transition peer to FAILED state {:?}", peer_id);
         state.peers.remove(peer_id);
         state.suspected.remove(&(when, id));
     }

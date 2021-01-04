@@ -29,8 +29,8 @@ pub enum Error {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("Cluster bootstrap failed")]
-    Bootstrap,
+    #[error("Bootstrap: {0}")]
+    Bootstrap(String),
     #[error("Configuration: {0}")]
     Configuration(String),
     #[error("Failed to shutdown gracefully")]

@@ -99,6 +99,8 @@ pub mod server {
 /// These are config details for the application
 #[derive(Deserialize)]
 pub struct Config {
+    name: String,
+    config_dir_path: String,
     quic: Quic,
     server: Server,
     client: Client,
@@ -126,6 +128,12 @@ impl Config {
     pub fn quic(&self) -> &Quic {
         &self.quic
     }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn config_dir_path(&self) -> &str {
+        &self.config_dir_path
+    }
 }
 
 #[derive(Deserialize)]
@@ -143,7 +151,6 @@ pub struct Server {
 #[derive(Deserialize)]
 pub struct Client {
     pub port: u16,
-    pub port_random: bool,
 }
 
 #[derive(Deserialize)]
@@ -199,13 +206,25 @@ impl Swim {
 /// Config builder
 /// Provide setters for optional fields
 pub struct ConfigBuilder {
-    port: Option<u16>,
+    server_port: Option<u16>,
+    client_port: Option<u16>,
+    name: Option<String>,
     bootstrap_peers: Option<Vec<String>>,
 }
 
 impl ConfigBuilder {
-    pub fn port(&mut self, port: u16) -> &mut Self {
-        self.port = Some(port);
+    pub fn server_port(&mut self, port: u16) -> &mut Self {
+        self.server_port = Some(port);
+        self
+    }
+
+    pub fn client_port(&mut self, port: u16) -> &mut Self {
+        self.client_port = Some(port);
+        self
+    }
+
+    pub fn name(&mut self, name: String) -> &mut Self {
+        self.name = Some(name);
         self
     }
 
@@ -218,14 +237,16 @@ impl ConfigBuilder {
 impl Default for ConfigBuilder {
     fn default() -> Self {
         Self {
-            port: None,
+            server_port: None,
+            client_port: None,
             bootstrap_peers: None,
+            name: None,
         }
     }
 }
 
 impl ConfigBuilder {
-    pub fn finish(&self) -> Result<Config, Error> {
+    pub fn finish(&mut self) -> Result<Config, Error> {
         let mut s = config::Config::default();
 
         s.merge(config::File::with_name("config").format(FileFormat::Yaml))
@@ -233,8 +254,16 @@ impl ConfigBuilder {
             .merge(config::Environment::with_prefix("app"))
             .map_err(|e| Error::Configuration(e.to_string()))?;
 
-        if let Some(port) = self.port {
+        if let Some(port) = self.server_port {
             s.set("server.port", port as i64).unwrap();
+        }
+
+        if let Some(port) = self.client_port {
+            s.set("client.port", port as i64).unwrap();
+        }
+
+        if let Some(name) = self.name.take() {
+            s.set("name", name).unwrap();
         }
 
         if let Some(ref boot_peers) = self.bootstrap_peers {
@@ -278,7 +307,7 @@ mod tests {
 
     #[test]
     fn builder() {
-        let changed_port = ConfigBuilder::default().port(444).finish().unwrap();
+        let changed_port = ConfigBuilder::default().server_port(444).finish().unwrap();
         assert_eq!(444 as u16, changed_port.server().port);
         assert_eq!(
             &vec![Address("127.0.0.1:8081".into())],
@@ -296,7 +325,7 @@ mod tests {
         );
 
         let full_builder = ConfigBuilder::default()
-            .port(4141)
+            .server_port(4141)
             .bootstrap_peers(vec!["192.168.0.2:8081".into()])
             .finish()
             .unwrap();

@@ -1,9 +1,8 @@
 use std::convert::TryFrom;
 use std::net::SocketAddr;
 
-use quinn::{ClientConfig, Endpoint, RecvStream, SendStream};
-use tokio::net::UdpSocket;
-use tracing::info;
+use quinn::{Endpoint, RecvStream, SendStream};
+use tracing::{error, info};
 
 use crate::config::{new_transport_cfg, Quic};
 use crate::connection::{ConnectionHolder, ConnectionPool};
@@ -11,19 +10,14 @@ use crate::message::Message;
 use crate::node::Address;
 use crate::Error;
 
-enum Endp {
-    RegularTtl,
-    ShortTtl,
-}
-
 pub struct Client {
     connection_pool: ConnectionPool,
     endpoint: Endpoint,
     cert_domain_name: String,
 }
-
+/// TODO: Should move this ti Membership::State struct
 impl Client {
-    pub fn new(quic_cfg: &crate::config::Quic, cfg: &crate::config::Client) -> crate::Result<Self> {
+    pub fn new(quic_cfg: &Quic, cfg: &crate::config::Client) -> crate::Result<Self> {
         let client_cfg = crate::config::client::insecure(new_transport_cfg(
             quic_cfg.timeout,
             quic_cfg.keep_alive,
@@ -31,15 +25,15 @@ impl Client {
         let mut endpoint_builder = Endpoint::builder();
         endpoint_builder.default_client_config(client_cfg);
 
-        let port = match cfg.port_random {
-            true => 0,
-            false => cfg.port,
-        };
-        let (endpoint, _) = endpoint_builder.bind(
-            &format!("127.0.0.1:{}", port)
-                .parse::<SocketAddr>()
-                .map_err(|e| Error::UnexpectedSrc(Box::new(e)))?,
-        )?;
+        let addr = &format!("127.0.0.1:{}", cfg.port)
+            .parse::<SocketAddr>()
+            .map_err(|e| Error::Configuration(e.to_string()))?;
+        let (endpoint, _) = endpoint_builder.bind(addr).map_err(|e| {
+            Error::Configuration(format!(
+                "client unable to bind to [{}]; source = {}",
+                &cfg.port, e
+            ))
+        })?;
 
         info!(addr = ?endpoint.local_addr()?, "created endpoint");
         Ok(Self {
@@ -51,6 +45,15 @@ impl Client {
 
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.endpoint.local_addr()
+    }
+
+    pub fn close(&self, addr: &Address) {
+        let addr = SocketAddr::try_from(addr).unwrap();
+
+        if let Some((conn, rem)) = self.connection_pool.get(&addr) {
+            info!("Remove connection {}", addr);
+            ConnectionHolder::new(conn, rem).close();
+        }
     }
 
     pub async fn connect_to(&self, addr: &Address) -> crate::Result<ConnectionHolder, Error> {
@@ -85,5 +88,15 @@ impl Client {
     ) -> crate::Result<(SendStream, RecvStream)> {
         let mut connection = self.connect_to(addr).await?;
         connection.send_bi(message).await
+    }
+
+    pub fn rtt(
+        &self,
+        addr: &Address,
+        default_rtt: &tokio::time::Duration,
+    ) -> tokio::time::Duration {
+        self.connection_pool
+            .get(&SocketAddr::try_from(addr).unwrap())
+            .map_or(*default_rtt, |(c, _)| c.rtt())
     }
 }

@@ -1,24 +1,27 @@
+name: local
+config_dir_path: .config/
 quic:
   timeout: 30000
-  keep_alive: 10000
+  keep_alive: 5000
   cert_domain_name: enutt
 client:
-  port: 10100
-  port_random: true
+  port: 10000
 server:
-  port: 8081
+  port: 8000
 network:
   bootstrap_nodes:
-    - 127.0.0.1:8081
+#    - 127.0.0.1:8096
+#    - 127.0.0.1:8097
+    - 127.0.0.1:8000
 gossip:
-  fanout: 4
-  frequency: 200
+  fanout: 2
+  frequency: 500
   # period multiplier
-  period_rate: 2
+  period_rate: 4
 swim:
-  initial_rtt: 500
+  initial_rtt: 600
   # period multiplier (initial_rtt * period_rate)
   # has to be at least 3x the initial_rtt
-  period_rate: 10
+  period_rate: 6
   # Number of peers to pick for indirect pinging
-  k: 2
+  k: 1

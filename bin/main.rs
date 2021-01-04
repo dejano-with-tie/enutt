@@ -1,21 +1,18 @@
 use tracing::{info, info_span, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use enutt::cluster::Cluster;
+use enutt::cluster::run;
 use enutt::config::ConfigBuilder;
 
 #[tokio::main]
 async fn main() -> enutt::Result<()> {
     config_tracing(Level::INFO);
 
-    info_span!("app");
-
-    let cluster = Cluster::new(ConfigBuilder::default().finish()?).await?;
-
-    cluster.bootstrap().await?;
+    let cluster = run(ConfigBuilder::default().finish()?).await?;
 
     tokio::signal::ctrl_c().await?;
-    info!("Got ctrl-c");
+    cluster.leave(true).await?;
+
     Ok(())
 }
 

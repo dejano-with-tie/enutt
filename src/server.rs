@@ -23,17 +23,15 @@ pub async fn run(ctx: Arc<Shared>, cfg: ServerConfig) -> Result<()> {
     endpoint.listen(cfg);
 
     let address = SocketAddr::try_from(ctx.membership().me().address()).map_err(|e| {
-        error!("unable to parse ip addr; source = {source}", source = e);
-        Error::Bootstrap
+        Error::Configuration(format!("unable to parse ip addr; source = [{:?}]", e))
     })?;
 
     let (endpoint, incoming) = match endpoint.bind(&address) {
         Ok(v) => v,
         Err(e) => {
-            error!(?e);
             return Err(Error::Configuration(format!(
-                "start failed; unable to bind to [{}]",
-                &address
+                "server unable to bind to [{}]; source = {}",
+                &address, e
             )));
         }
     };
@@ -46,7 +44,7 @@ pub async fn run(ctx: Arc<Shared>, cfg: ServerConfig) -> Result<()> {
 
     tokio::spawn(
         async move {
-            server.run().await;
+            server.listen().await;
         }
         .in_current_span(),
     );
@@ -63,7 +61,7 @@ struct Server {
 }
 
 impl Server {
-    async fn run(&mut self) {
+    async fn listen(&mut self) {
         while let Some(connection) = self.incoming.next().await {
             let remote_addr = connection.remote_address();
 
@@ -107,7 +105,7 @@ impl ConnectionHandler {
                 Some(stream) = bi_streams.next() => {
                     let (send, recv) = match stream {
                         Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
-                            debug!("terminated by peer");
+                            error!("terminated by peer");
                             return Ok(());
                         }
                         Err(e) => return Err(e.into()),
@@ -119,7 +117,7 @@ impl ConnectionHandler {
                      let recv = match stream {
                         Ok(s) => s,
                         Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
-                            debug!("terminated by peer");
+                            error!("terminated by peer");
                             return Ok(());
                         }
                         Err(e) => return Err(e.into()),
@@ -158,24 +156,28 @@ impl RequestHandler {
         mut send: Option<quinn::SendStream>,
         mut recv: quinn::RecvStream,
     ) -> Result<()> {
-        loop {
-            let message = match Message::read(&mut recv).await {
-                Ok(Some(message)) => message,
-                Ok(None) => {
-                    debug!("stream closed by peer");
-                    return Ok(());
-                }
-                // close the stream
-                Err(e) => return Err(e.into()),
-            };
-
-            debug!("incoming: {}", message);
-            match send {
-                Some(ref mut send) => Right(self.handle_bi_request(message, send)),
-                None => Left(self.handle_uni_request(message)),
+        // NOTE: we are not reusing streams, no need to loop
+        // loop {
+        let message = match Message::read(&mut recv).await {
+            Ok(Some(message)) => message,
+            Ok(None) => {
+                error!("stream closed by peer");
+                return Ok(());
             }
-            .await?;
+            // close the stream
+            Err(e) => {
+                return Err(e.into());
+            }
+        };
+
+        debug!("incoming: {}", message);
+        match send {
+            Some(ref mut send) => Right(self.handle_bi_request(message, send)),
+            None => Left(self.handle_uni_request(message)),
         }
+        .await?;
+        // }
+        Ok(())
     }
 
     /// Any error returned will break the current stream but not the connection itself
@@ -197,6 +199,7 @@ impl RequestHandler {
             }
             Message::Leave(peer) => {
                 self.ctx.membership().remove(peer.id());
+                self.ctx.client().close(peer.inner().address());
                 Some(multicast)
             }
             Message::Suspect(peer) => {
@@ -225,7 +228,7 @@ impl RequestHandler {
         request: Message,
         send: &mut quinn::SendStream,
     ) -> Result<()> {
-        let response = match request {
+        let response = match request.clone() {
             Message::Join(peer) => handle_join(&self.ctx, peer)?,
             Message::Ping => Some(Message::Ack),
             Message::IndirectPing(peer) => handle_indirect_ping(self.ctx.client(), peer).await,
@@ -237,7 +240,10 @@ impl RequestHandler {
 
         // not sure if it is good idea to finish send part of the stream in bi directional stream when response is `None`
         if let Some(response) = response {
-            response.write(send).await?
+            if let Err(e) = response.write(send).await {
+                error!("FAILED TO WRITE BACK IN BI STREAM: {:?}", request);
+                return Err(e.into());
+            }
         }
 
         Ok(())
